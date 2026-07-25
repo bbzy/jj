@@ -62,7 +62,7 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::backend::BackendError;
-
+use crate::backend::CommitId;
 use crate::backend::CopyId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
@@ -100,6 +100,7 @@ use crate::gitattributes::GitAttributes;
 use crate::gitattributes::SearchPriority;
 use crate::gitattributes::TreeFileLoader;
 use crate::gitignore::GitIgnoreFile;
+use crate::gitmodules::GitModules;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
 use crate::matchers::EverythingMatcher;
@@ -962,6 +963,101 @@ fn file_state(metadata: &Metadata) -> Result<Option<FileState>, MtimeOutOfRange>
     }
 }
 
+/// Loads and parses `.gitmodules` from a tree, returning an empty
+/// `GitModules` if the file is absent or unreadable.
+async fn load_git_modules(tree: &MergedTree) -> GitModules {
+    let path = RepoPath::from_internal_string(".gitmodules").unwrap();
+    let Ok(value) = tree.path_value(path).await else {
+        return GitModules::default();
+    };
+    if !value.is_resolved() {
+        tracing::warn!(
+            ".gitmodules is in conflict; using first available version for submodule info"
+        );
+    }
+    let Some(TreeValue::File { id, .. }) = value.iter().flatten().next().cloned() else {
+        return GitModules::default();
+    };
+    let Ok(mut reader) = tree.store().read_file(path, &id).await else {
+        return GitModules::default();
+    };
+    let mut content = Vec::new();
+    if reader.read_to_end(&mut content).await.is_err() {
+        return GitModules::default();
+    }
+    match GitModules::parse(&content) {
+        Ok(modules) => modules,
+        Err(err) => {
+            eprintln!("warning: failed to parse .gitmodules: {err}");
+            GitModules::default()
+        }
+    }
+}
+
+/// Attempts to populate a git submodule using the submodule store (bare git
+/// repo) to check out the working copy, instead of relying on `git submodule
+/// update --init`.
+///
+/// Works for both colocated and non-colocated repos.
+///
+/// `submodule_path` is the repo-relative path of the submodule (e.g. `"sub"`).
+/// `checkout_path` is the filesystem path where the submodule directory should
+/// be populated.
+fn try_populate_submodule(
+    store: &Store,
+    submodule_name: &str,
+    submodule_url: &str,
+    submodule_path: &RepoPath,
+    commit_id: &CommitId,
+    checkout_path: &Path,
+) -> bool {
+    let Some(sm) = store.submodule_store() else {
+        return false;
+    };
+
+    if let Err(err) = sm.ensure_bare_repo(submodule_name, submodule_url) {
+        tracing::warn!(
+            submodule_name,
+            submodule_path = %submodule_path.as_internal_file_string(),
+            url = %submodule_url,
+            error = %err,
+            "failed to ensure submodule bare repo"
+        );
+        return false;
+    }
+
+    if let Err(err) = sm.fetch(submodule_name, submodule_url) {
+        tracing::warn!(
+            submodule_name,
+            url = %submodule_url,
+            error = %err,
+            "failed to fetch submodule"
+        );
+        return false;
+    }
+
+    match sm.checkout(submodule_name, commit_id, checkout_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                submodule_name,
+                "submodule checkout skipped (bare repo missing or git worktree add failed)"
+            );
+            return false;
+        }
+        Err(err) => {
+            tracing::warn!(
+                submodule_name,
+                error = %err,
+                "failed to checkout submodule from bare repo"
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
 struct FsmonitorMatcher {
     matcher: Option<Box<dyn Matcher>>,
     watchman_clock: Option<crate::protos::local_working_copy::WatchmanClock>,
@@ -981,6 +1077,9 @@ pub struct TreeStateSettings {
     pub exec_change_setting: ExecChangeSetting,
     /// The fsmonitor (e.g. Watchman) to use, if any.
     pub fsmonitor_settings: FsmonitorSettings,
+    /// Whether to automatically fetch and check out git submodules during
+    /// checkout.
+    pub auto_update_submodules: bool,
 }
 
 impl TreeStateSettings {
@@ -991,6 +1090,7 @@ impl TreeStateSettings {
             eol_conversion_mode: EolConversionMode::try_from_settings(user_settings)?,
             exec_change_setting: user_settings.get("working-copy.exec-bit-change")?,
             fsmonitor_settings: FsmonitorSettings::from_settings(user_settings)?,
+            auto_update_submodules: user_settings.get("git.submodule.auto-update")?,
         })
     }
 }
@@ -1016,6 +1116,7 @@ pub struct TreeState {
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
     filter_driver_cache: Arc<FilterDriverCache>,
+    auto_update_submodules: bool,
 }
 
 #[derive(Debug, Error)]
@@ -1089,6 +1190,7 @@ impl TreeState {
             eol_conversion_mode,
             exec_change_setting,
             fsmonitor_settings,
+            auto_update_submodules,
         }: &TreeStateSettings,
     ) -> Self {
         let exec_policy = ExecChangePolicy::new(*exec_change_setting, &state_path);
@@ -1111,6 +1213,7 @@ impl TreeState {
                 store.clone(),
                 working_copy_path_for_filters,
             )),
+            auto_update_submodules: *auto_update_submodules,
         }
     }
 
@@ -1901,6 +2004,8 @@ impl FileSnapshotter<'_> {
                 PresentDirEntryKind::File => !present_entries.files.contains(name),
             })
             .flat_map(|(_, chunk)| chunk)
+            // Whether or not the entry exists, submodule should be ignored
+            .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
             .filter(|(path, _)| self.matcher.matches(path))
             .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
             .ok();
@@ -2428,6 +2533,10 @@ impl TreeState {
             DiskFileLoader::new(self.working_copy_path.clone()),
         );
 
+        // Parse .gitmodules from the target tree, if present, to provide
+        // better submodule information during checkout.
+        let checkout_git_modules = load_git_modules(new_tree).await;
+
         let mut process_diff_entry = async |path: RepoPathBuf,
                                             before: MergedTreeValue,
                                             after: MaterializedTreeValue|
@@ -2450,7 +2559,51 @@ impl TreeState {
             if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
                 && matches!(after, MaterializedTreeValue::GitSubmodule(_))
             {
-                eprintln!("ignoring git submodule at {path:?}");
+                let MaterializedTreeValue::GitSubmodule(after_id) = &after else {
+                    unreachable!()
+                };
+                let disk_path = self.working_copy_path.join(path.as_internal_file_string());
+                // Attempt to update the submodule to the new commit via the
+                // submodule store, which does not rely on git submodule commands.
+                if self.auto_update_submodules {
+                    if let Some(entry) = checkout_git_modules.entry_by_path(&path) {
+                        if try_populate_submodule(
+                            self.store.as_ref(),
+                            &entry.name,
+                            &entry.url,
+                            &path,
+                            after_id,
+                            &disk_path,
+                        ) {
+                            tracing::info!(
+                                submodule_name = ?entry.name,
+                                path = ?path,
+                                url = %entry.url,
+                                "git submodule updated"
+                            );
+                        } else {
+                            tracing::warn!(
+                                submodule_name = ?entry.name,
+                                path = ?path,
+                                url = %entry.url,
+                                "git submodule update failed; preserving existing directory"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            path = ?path,
+                            "git submodule update failed; preserving existing directory \
+                             (no .gitmodules entry found)"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        path = ?path,
+                        "git submodule update skipped (auto-update disabled)"
+                    );
+                }
+                // Not updating the file state as if there were no diffs. Leave
+                // the state type as FileType::GitSubmodule if it was before.
                 return Ok(());
             }
 
@@ -2639,16 +2792,60 @@ impl TreeState {
                             .await?
                     }
                 }
-                MaterializedTreeValue::GitSubmodule(_) => {
-                    eprintln!("ignoring git submodule at {path:?}");
-                    // Git behavior: Create the submodule directory but don't
-                    // populate/overwrite the contents.
-                    match fs::create_dir(&disk_path) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(err) => eprintln!(
-                            "warning: failed to create submodule directory {path:?}: {err}"
-                        ),
+                MaterializedTreeValue::GitSubmodule(ref after_id) => {
+                    // Create the directory first (needed even if population
+                    // fails).
+                    let dir_created = match fs::create_dir(&disk_path) {
+                        Ok(()) => true,
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => true,
+                        Err(err) => {
+                            tracing::warn!(
+                                path = ?path,
+                                error = %err,
+                                "failed to create submodule directory"
+                            );
+                            false
+                        }
+                    };
+                    // Attempt to populate the submodule automatically via the
+                    // submodule store, which does not rely on git submodule
+                    // commands.
+                    if dir_created && self.auto_update_submodules {
+                        if let Some(entry) = checkout_git_modules.entry_by_path(&path) {
+                            if try_populate_submodule(
+                                self.store.as_ref(),
+                                &entry.name,
+                                &entry.url,
+                                &path,
+                                after_id,
+                                &disk_path,
+                            ) {
+                                tracing::info!(
+                                    submodule_name = ?entry.name,
+                                    path = ?path,
+                                    url = %entry.url,
+                                    "git submodule populated"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    submodule_name = ?entry.name,
+                                    path = ?path,
+                                    url = %entry.url,
+                                    "git submodule not populated; creating empty directory"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                path = ?path,
+                                "git submodule not populated; creating empty directory \
+                                 (no .gitmodules entry found)"
+                            );
+                        }
+                    } else if dir_created {
+                        tracing::info!(
+                            path = ?path,
+                            "git submodule not populated; auto-update disabled"
+                        );
                     }
                     FileState::for_gitsubmodule()
                 }
@@ -2773,7 +2970,9 @@ impl TreeState {
                         }
                         TreeValue::Symlink(_id) => FileType::Symlink,
                         TreeValue::GitSubmodule(_id) => {
-                            eprintln!("ignoring git submodule at {path:?}");
+                            // reset() only updates internal file-state tracking;
+                            // it does not touch the filesystem. The submodule
+                            // directory on disk is left as-is.
                             FileType::GitSubmodule
                         }
                         TreeValue::Tree(_id) => {

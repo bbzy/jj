@@ -179,6 +179,7 @@ pub(crate) async fn check_out_trees(
             eol_conversion_mode: EolConversionMode::None,
             exec_change_setting: ExecChangeSetting::Auto,
             fsmonitor_settings: FsmonitorSettings::None,
+            auto_update_submodules: false,
         };
         let mut state = TreeState::init(store.clone(), wc_path, state_dir, &tree_state_settings)?;
         state.set_sparse_patterns(changed_files.clone())?;

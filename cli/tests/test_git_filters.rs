@@ -570,6 +570,134 @@ fn test_filter_in_multiple_workspaces() -> TestResult {
     Ok(())
 }
 
+/// Test that LFS filters and submodules coexist correctly in a workspace.
+///
+/// This is the "full stack" test: a repo with both filtered files and a
+/// submodule, verified in both the main workspace and a second workspace.
+#[test]
+fn test_filter_and_submodule_in_workspace() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.submodule.auto-update = true");
+
+    // Create a submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submod"])
+        .success();
+    let submod_dir = test_env.work_dir("submod");
+    submod_dir.write_file("subfile", "sub content\n");
+    submod_dir
+        .run_jj(["commit", "-m", "submodule init"])
+        .success();
+
+    // Create the main repo with a filter and a submodule.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    add_filter_config(&main_dir, "testfilter", "tr o 0", "tr 0 o");
+    main_dir.write_file(".gitattributes", "*.bin filter=testfilter\n");
+    main_dir.write_file("data.bin", "hello world\n");
+
+    // Snapshot and commit the filtered file via jj.
+    main_dir.run_jj(["st"]).success();
+    main_dir
+        .run_jj(["commit", "-m", "add filtered file"])
+        .success();
+
+    // Verify stored content is cleaned.
+    let output = main_dir.run_jj(["file", "show", "data.bin"]);
+    insta::assert_snapshot!(output, @"
+    hell0 w0rld
+    [EOF]
+    ");
+
+    // Add submodule via git.
+    let output = main_dir.run_jj([
+        "util",
+        "exec",
+        "--",
+        "git",
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        &format!("{}/submod", test_env.env_root().display()),
+        "sub",
+    ]);
+    assert!(
+        output.status.success(),
+        "git submodule add failed: {output}"
+    );
+
+    // Commit the submodule via git.
+    let output = main_dir.run_jj([
+        "util",
+        "exec",
+        "--",
+        "git",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test user",
+        "commit",
+        "-m",
+        "add submodule",
+    ]);
+    assert!(output.status.success(), "git commit failed: {output}");
+
+    // Import the git commit into jj.
+    main_dir.run_jj(["st"]).success();
+
+    // Create a second workspace.
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../second"])
+        .success();
+    let second_dir = test_env.work_dir("second");
+
+    // LFS file should be smudged in second workspace.
+    let disk_content = second_dir.read_file("data.bin");
+    let disk_str = String::from_utf8_lossy(&disk_content);
+    assert_eq!(
+        disk_str, "hello world\n",
+        "smudge filter should restore content in second workspace"
+    );
+
+    // Submodule directory should exist but be empty.
+    assert!(
+        second_dir.root().join("sub").is_dir(),
+        "submodule directory should exist in second workspace"
+    );
+    // The submodule directory should be populated via the submodule store
+    // in non-colocated workspaces.
+    let entries: Vec<_> = std::fs::read_dir(second_dir.root().join("sub"))
+        .unwrap()
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "submodule directory should be populated in non-colocated second workspace"
+    );
+
+    // .gitmodules should be present.
+    let gitmodules = second_dir.read_file(".gitmodules");
+    let gm_str = String::from_utf8_lossy(&gitmodules);
+    assert!(
+        gm_str.contains("[submodule \"sub\"]"),
+        ".gitmodules should be present, got: {gm_str}"
+    );
+
+    // Modifying the filtered file in second workspace should apply clean filter.
+    second_dir.write_file("data.bin", "foo bar\n");
+    second_dir.run_jj(["st"]).success();
+    let output = second_dir.run_jj(["file", "show", "data.bin"]);
+    insta::assert_snapshot!(output, @"
+    f00 bar
+    [EOF]
+    ");
+
+    Ok(())
+}
+
 /// Test that a subdirectory `.gitattributes` can unset a filter set by the
 /// root `.gitattributes`.
 #[test]
@@ -742,6 +870,107 @@ fn test_filter_gitattributes_modified_on_disk() -> TestResult {
     hell0 w0rld
     [EOF]
     ");
+
+    Ok(())
+}
+
+/// Test that filter smudge and submodule populate both work during the same
+/// checkout in a colocated repo. This verifies the two features don't
+/// interfere when active simultaneously.
+#[test]
+fn test_filter_and_submodule_combined_checkout() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.submodule.auto-update = true");
+
+    // Create a submodule repo with a file (no filter — filter config is
+    // not cloned by git submodule update --init, so we keep it simple).
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submod"])
+        .success();
+    let submod_dir = test_env.work_dir("submod");
+    submod_dir.write_file("subfile.txt", "sub content\n");
+    submod_dir
+        .run_jj(["commit", "-m", "submodule init"])
+        .success();
+
+    // Create the main repo with its own filtered file.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    add_filter_config(&main_dir, "testfilter", "tr o 0", "tr 0 o");
+    main_dir.write_file(".gitattributes", "*.bin filter=testfilter\n");
+    main_dir.write_file("data.bin", "hello world\n");
+    main_dir.run_jj(["st"]).success();
+    main_dir
+        .run_jj(["commit", "-m", "add filtered file"])
+        .success();
+    main_dir
+        .run_jj(["bookmark", "create", "nofilter"])
+        .success();
+
+    // Add submodule via git.
+    main_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submod", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    main_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "add submodule",
+        ])
+        .success();
+    main_dir.run_jj(["st"]).success();
+    main_dir.run_jj(["bookmark", "create", "withsub"]).success();
+
+    // Switch to the commit without submodule.
+    main_dir.run_jj(["new", "nofilter"]).success();
+    // Remove the submodule directory and filtered file.
+    let _ = std::fs::remove_dir_all(main_dir.root().join("sub")).ok();
+    let _ = std::fs::remove_file(main_dir.root().join("data.bin")).ok();
+
+    // Switch back — both smudge filter and submodule populate should run.
+    let output = main_dir.run_jj(["new", "withsub"]);
+    output.success();
+
+    // Filtered file: smudge should have restored original content.
+    let disk_content = main_dir.read_file("data.bin");
+    let disk_str = String::from_utf8_lossy(&disk_content);
+    assert_eq!(
+        disk_str, "hello world\n",
+        "smudge filter should restore content during combined checkout"
+    );
+
+    // Submodule: should be populated.
+    let subfile = main_dir.root().join("sub").join("subfile.txt");
+    assert!(
+        subfile.exists(),
+        "submodule file should exist after combined checkout"
+    );
+    let content = std::fs::read_to_string(&subfile).unwrap();
+    assert_eq!(
+        content, "sub content\n",
+        "submodule content should be correct after combined checkout"
+    );
 
     Ok(())
 }

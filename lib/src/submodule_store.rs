@@ -16,6 +16,25 @@
 
 use std::fmt::Debug;
 
+use crate::backend::CommitId;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubmoduleStoreError {
+    #[error("Submodule action failed: {0}")]
+    Other(String),
+}
+
 pub trait SubmoduleStore: Send + Sync + Debug {
     fn name(&self) -> &str;
+
+    fn ensure_bare_repo(&self, name: &str, url: &str) -> Result<(), SubmoduleStoreError>;
+
+    fn fetch(&self, name: &str, url: &str) -> Result<(), SubmoduleStoreError>;
+
+    fn checkout(
+        &self,
+        name: &str,
+        commit_id: &CommitId,
+        working_copy_path: &std::path::Path,
+    ) -> Result<bool, SubmoduleStoreError>;
 }

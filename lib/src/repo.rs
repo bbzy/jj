@@ -258,7 +258,8 @@ impl ReadonlyRepo {
         let submodule_store_type_path = submodule_store_path.join("type");
         fs::write(&submodule_store_type_path, submodule_store.name())
             .context(&submodule_store_type_path)?;
-        let submodule_store = Arc::from(submodule_store);
+        let submodule_store: Arc<dyn SubmoduleStore> = Arc::from(submodule_store);
+        store.set_submodule_store(submodule_store.clone());
 
         let loader = RepoLoader {
             settings: settings.clone(),
@@ -674,9 +675,10 @@ impl RepoLoader {
             Arc::from(store_factories.load_op_heads_store(settings, &repo_path.join("op_heads"))?);
         let index_store =
             Arc::from(store_factories.load_index_store(settings, &repo_path.join("index"))?);
-        let submodule_store = Arc::from(
+        let submodule_store: Arc<dyn SubmoduleStore> = Arc::from(
             store_factories.load_submodule_store(settings, &repo_path.join("submodule_store"))?,
         );
+        store.set_submodule_store(submodule_store.clone());
         Ok(Self {
             settings: settings.clone(),
             store,

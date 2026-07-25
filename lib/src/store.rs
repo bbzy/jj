@@ -20,6 +20,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use clru::CLruCache;
@@ -44,6 +45,7 @@ use crate::merged_tree::MergedTree;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::signing::Signer;
+use crate::submodule_store::SubmoduleStore;
 use crate::tree::Tree;
 use crate::tree_merge::MergeOptions;
 
@@ -60,6 +62,7 @@ pub struct Store {
     commit_cache: Mutex<CLruCache<CommitId, Arc<backend::Commit>>>,
     tree_cache: Mutex<CLruCache<(RepoPathBuf, TreeId), Arc<backend::Tree>>>,
     merge_options: MergeOptions,
+    submodule_store: OnceLock<Arc<dyn SubmoduleStore>>,
 }
 
 impl Debug for Store {
@@ -82,7 +85,16 @@ impl Store {
             commit_cache: Mutex::new(CLruCache::new(COMMIT_CACHE_CAPACITY)),
             tree_cache: Mutex::new(CLruCache::new(TREE_CACHE_CAPACITY)),
             merge_options,
+            submodule_store: OnceLock::new(),
         })
+    }
+
+    pub fn submodule_store(&self) -> Option<&Arc<dyn SubmoduleStore>> {
+        self.submodule_store.get()
+    }
+
+    pub fn set_submodule_store(&self, store: Arc<dyn SubmoduleStore>) {
+        self.submodule_store.set(store).ok();
     }
 
     pub fn backend(&self) -> &dyn Backend {

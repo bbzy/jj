@@ -15,6 +15,9 @@ executable-path = "git"
 record-synthetic-predecessors = true
 write-change-id-header = true
 
+[git.submodule]
+auto-update = false
+
 [merge]
 hunk-level = "line"
 # TODO: Consider making "keep" the default, and maybe add an option to be used

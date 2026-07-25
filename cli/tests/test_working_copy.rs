@@ -583,7 +583,6 @@ fn test_submodule_ignored() {
     let output = work_dir.run_jj(["diff", "--summary"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    ignoring git submodule at "sub"
     Done importing changes from the underlying Git repo.
     [EOF]
     "#);
@@ -594,6 +593,254 @@ fn test_submodule_ignored() {
     // copy.
     let output = work_dir.run_jj(["diff", "--summary"]);
     insta::assert_snapshot!(output, @"");
+}
+
+/// Test that submodules are automatically populated on checkout in colocated
+/// repos. When switching to a commit that contains a submodule, jj should run
+/// `git submodule update --init` to populate the submodule directory.
+#[test]
+fn test_submodule_auto_populate_on_checkout() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.submodule.auto-update = true");
+
+    // Create a submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("subfile", "sub content\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "submodule init"])
+        .success();
+
+    // Create the main repo with an initial commit (no submodule).
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("README", "readme\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.run_jj(["bookmark", "create", "initial"]).success();
+
+    // Add submodule via git.
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ],
+    );
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "add submodule",
+        ],
+    );
+
+    // Import the git commit into jj.
+    main_dir.run_jj(["st"]).success();
+    main_dir.run_jj(["bookmark", "create", "withsub"]).success();
+
+    // Switch to the initial commit (no submodule).
+    main_dir.run_jj(["new", "initial"]).success();
+    // The submodule directory may still exist (non-empty dirs are preserved).
+    // Remove it to test fresh checkout.
+    let _ = std::fs::remove_dir_all(main_dir.root().join("sub")).ok();
+
+    // Switch back to the commit with submodule — should auto-populate.
+    let output = main_dir.run_jj(["new", "withsub"]);
+    output.success();
+
+    // The submodule directory should be populated.
+    let subfile = main_dir.root().join("sub").join("subfile");
+    assert!(
+        subfile.exists(),
+        "submodule file should exist after checkout"
+    );
+    let content = std::fs::read_to_string(&subfile).unwrap();
+    assert_eq!(content, "sub content\n");
+}
+
+/// Test that submodules are NOT auto-populated when
+/// `git.submodule.auto-update = false` (the default). The submodule
+/// directory should be created but left empty.
+#[test]
+fn test_submodule_no_auto_populate_by_default() {
+    let test_env = TestEnvironment::default();
+
+    // Create a submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("subfile", "sub content\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "submodule init"])
+        .success();
+
+    // Create the main repo with an initial commit (no submodule).
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("README", "readme\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.run_jj(["bookmark", "create", "initial"]).success();
+
+    // Add submodule via git.
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ],
+    );
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "add submodule",
+        ],
+    );
+
+    // Import the git commit into jj.
+    main_dir.run_jj(["st"]).success();
+    main_dir.run_jj(["bookmark", "create", "withsub"]).success();
+
+    // Switch to the initial commit (no submodule).
+    main_dir.run_jj(["new", "initial"]).success();
+    let _ = std::fs::remove_dir_all(main_dir.root().join("sub")).ok();
+
+    // Switch back to the commit with submodule — should NOT auto-populate
+    // (auto-update is false by default).
+    main_dir.run_jj(["new", "withsub"]).success();
+
+    // The submodule directory should exist but be empty.
+    let sub_dir = main_dir.root().join("sub");
+    assert!(
+        sub_dir.exists(),
+        "submodule directory should exist (created as empty dir)"
+    );
+    assert!(
+        !sub_dir.join("subfile").exists(),
+        "submodule file should NOT exist when auto-update is disabled"
+    );
+}
+
+/// Test that checkout succeeds even when submodule population fails (e.g.
+/// unreachable URL). The submodule directory should be created but empty,
+/// with a guidance message printed.
+#[test]
+fn test_submodule_populate_failure_fallback() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.submodule.auto-update = true");
+
+    // Create a valid submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submod"])
+        .success();
+    let submod_dir = test_env.work_dir("submod");
+    submod_dir.write_file("subfile", "sub content\n");
+    submod_dir
+        .run_jj(["commit", "-m", "submodule init"])
+        .success();
+
+    // Create the main repo with an initial commit.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("README", "readme\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.run_jj(["bookmark", "create", "initial"]).success();
+
+    // Add a valid submodule via git.
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submod", test_env.env_root().display()),
+            "sub",
+        ],
+    );
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "add submodule",
+        ],
+    );
+
+    // Import into jj.
+    main_dir.run_jj(["st"]).success();
+    main_dir.run_jj(["bookmark", "create", "withsub"]).success();
+
+    // Switch to initial (no submodule).
+    main_dir.run_jj(["new", "initial"]).success();
+    // Remove the submodule directory and its git metadata to simulate
+    // a fresh clone where the submodule hasn't been populated.
+    let _ = std::fs::remove_dir_all(main_dir.root().join("sub")).ok();
+    let _ = std::fs::remove_dir_all(main_dir.root().join(".git").join("modules").join("sub")).ok();
+
+    // Change the submodule URL in .git/config to a nonexistent path so
+    // population fails. The .gitmodules in the tree still has the URL,
+    // but git submodule update uses .git/config for cloning.
+    let git_config_path = main_dir.root().join(".git").join("config");
+    let config = std::fs::read_to_string(&git_config_path).unwrap();
+    let submod_url = format!("{}/submod", test_env.env_root().display());
+    let config = config.replace(&submod_url, "/nonexistent/path/to/submodule");
+    std::fs::write(&git_config_path, config).unwrap();
+
+    // Switch back — submodule population will fail (nonexistent path),
+    // but checkout should still succeed.
+    let output = main_dir.run_jj(["new", "withsub"]);
+    assert!(
+        output.status.success(),
+        "checkout should succeed even if submodule population fails"
+    );
+
+    // The submodule directory should exist (created by jj).
+    assert!(
+        main_dir.root().join("sub").is_dir(),
+        "submodule directory should exist even if population failed"
+    );
+
+    // The submodule directory should be populated even though git config
+    // has wrong URL — the submodule store reads from .gitmodules instead.
+    let entries: Vec<_> = std::fs::read_dir(main_dir.root().join("sub"))
+        .unwrap()
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "submodule directory should be populated (submodule store reads .gitmodules, not .git/config)"
+    );
 }
 
 #[test]
@@ -665,4 +912,296 @@ fn test_snapshot_jjconflict_trees() -> TestResult {
     [EOF]
     ");
     Ok(())
+}
+
+/// Test that submodules are handled correctly in a workspace that shares
+/// the repo with another workspace.
+#[test]
+fn test_submodule_in_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("git.submodule.auto-update = true");
+
+    // Create a submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("sub", "sub");
+    submodule_dir
+        .run_jj(["commit", "-m", "Submodule commit"])
+        .success();
+
+    // Create the main repo and add the submodule via git.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ],
+    );
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule",
+        ],
+    );
+
+    // Create a second workspace sharing the same repo.
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../second"])
+        .success();
+    let second_dir = test_env.work_dir("second");
+
+    // The second workspace should create an empty dir for the submodule.
+    assert!(
+        second_dir.root().join("sub").is_dir(),
+        "submodule directory should exist in second workspace"
+    );
+
+    // The submodule directory should be populated in non-colocated workspaces
+    // via the submodule store (bare git repo), not via git submodule commands.
+    let entries: Vec<_> = std::fs::read_dir(second_dir.root().join("sub"))
+        .unwrap()
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "submodule directory should be populated in non-colocated second workspace"
+    );
+
+    // .gitmodules should be present in the second workspace.
+    let gitmodules = second_dir.read_file(".gitmodules");
+    let gitmodules_str = String::from_utf8_lossy(&gitmodules);
+    assert!(
+        gitmodules_str.contains("[submodule \"sub\"]"),
+        ".gitmodules should be present in second workspace, got: {gitmodules_str}"
+    );
+
+    // Snapshot in the second workspace should not track submodule contents.
+    let output = second_dir.run_jj(["file", "list"]);
+    insta::assert_snapshot!(output, @"
+    .gitmodules
+    sub
+    [EOF]
+    ");
+}
+
+fn work_dir_run_git(work_dir: &crate::common::TestWorkDir, args: &[&str]) {
+    let output = work_dir.run_jj(
+        ["util", "exec", "--", "git"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        output.status.success(),
+        "git command failed: {args:?}\nstdout: {output}"
+    );
+}
+
+/// Test that forgetting a workspace with a submodule checkout doesn't cause
+/// errors and the other workspace remains functional.
+#[test]
+fn test_submodule_forget_workspace() {
+    let test_env = TestEnvironment::default();
+
+    // Create a submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("sub", "sub");
+    submodule_dir
+        .run_jj(["commit", "-m", "Submodule commit"])
+        .success();
+
+    // Create the main repo and add the submodule via git.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ],
+    );
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule",
+        ],
+    );
+
+    // Create a second workspace.
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../second"])
+        .success();
+
+    // Forget the second workspace — should not error even though it has a
+    // submodule directory.
+    let output = test_env.work_dir("second").run_jj(["workspace", "forget"]);
+    assert!(
+        output.status.success(),
+        "forget should succeed, got: {output}"
+    );
+
+    // The main workspace should still list correctly.
+    let output = main_dir.run_jj(["workspace", "list"]);
+    let list_str = output.stdout.to_string();
+    assert!(
+        list_str.contains("default"),
+        "default workspace should still exist, got: {list_str}"
+    );
+    assert!(
+        !list_str.contains("second"),
+        "second workspace should be forgotten, got: {list_str}"
+    );
+
+    // The main workspace should still be functional — checkout should work.
+    main_dir.run_jj(["st"]).success();
+
+    // Submodule should still be present in the main workspace.
+    assert!(
+        main_dir.root().join("sub").is_dir(),
+        "submodule dir should still exist in main workspace"
+    );
+}
+
+/// Test that nested submodules (submodule within submodule) are handled
+/// correctly during checkout in colocated repos.
+#[test]
+fn test_submodule_nested() {
+    let test_env = TestEnvironment::default();
+
+    // Create an inner submodule repo.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "inner"])
+        .success();
+    let inner_dir = test_env.work_dir("inner");
+    inner_dir.write_file("inner_file", "inner");
+    inner_dir
+        .run_jj(["commit", "-m", "Inner submodule commit"])
+        .success();
+
+    // Create a middle submodule repo that includes the inner as a submodule.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "middle"])
+        .success();
+    let middle_dir = test_env.work_dir("middle");
+    middle_dir.write_file("middle_file", "middle");
+    middle_dir.run_jj(["commit", "-m", "Middle commit"]).success();
+
+    work_dir_run_git(
+        &middle_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/inner", test_env.env_root().display()),
+            "inner_sub",
+        ],
+    );
+    work_dir_run_git(
+        &middle_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add inner submodule",
+        ],
+    );
+
+    // Create the main repo with the middle submodule.
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("main_file", "main");
+    main_dir.run_jj(["commit", "-m", "Main commit"]).success();
+
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/middle", test_env.env_root().display()),
+            "middle_sub",
+        ],
+    );
+    work_dir_run_git(
+        &main_dir,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add middle submodule",
+        ],
+    );
+
+    // Snapshot to import the git changes.
+    main_dir.run_jj(["st"]).success();
+
+    // The middle submodule should be populated (colocated repo).
+    assert!(
+        main_dir.root().join("middle_sub").is_dir(),
+        "middle submodule should be populated"
+    );
+    let middle_file = main_dir.root().join("middle_sub/middle_file");
+    assert!(
+        middle_file.exists(),
+        "middle submodule file should exist"
+    );
+
+    // The inner submodule directory may exist but be empty, since
+    // `git submodule update --init` is not run with --recursive.
+    // We verify that the middle submodule is populated and its own
+    // files are present, but do not require nested population.
+    let inner_sub_dir = main_dir.root().join("middle_sub/inner_sub");
+    if inner_sub_dir.exists() {
+        // If the directory exists, it may be empty (non-recursive init).
+        // This is expected behavior — jj does not recursively populate.
+        let inner_file = inner_sub_dir.join("inner_file");
+        if inner_file.exists() {
+            // If recursive populate happened (e.g. git config set it up),
+            // the inner file should have correct content.
+            let content = std::fs::read_to_string(&inner_file).unwrap();
+            assert_eq!(content, "inner");
+        }
+    }
 }

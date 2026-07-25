@@ -559,6 +559,17 @@
                     "enum": ["sha1", "sha256"],
                     "description": "Object hash algorithm used when initializing a new Git repository",
                     "default": "sha1"
+                },
+                "submodule": {
+                    "type": "object",
+                    "description": "Settings for git submodule behavior",
+                    "properties": {
+                        "auto-update": {
+                            "type": "boolean",
+                            "description": "Whether to automatically fetch and check out git submodules during checkout",
+                            "default": false
+                        }
+                    }
                 }
             }
         },
