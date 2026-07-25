@@ -55,7 +55,9 @@ pub mod git;
 pub mod git_backend;
 #[cfg(feature = "git")]
 mod git_subprocess;
+pub(crate) mod gitattributes;
 pub mod gitignore;
+pub mod gitmodules;
 pub mod gpg_signing;
 pub use jj_core::graph;
 pub mod graph_dominators;
