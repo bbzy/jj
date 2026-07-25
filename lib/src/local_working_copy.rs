@@ -1475,6 +1475,7 @@ impl TreeState {
                 dir: RepoPathBuf::root(),
                 disk_dir: self.working_copy_path.clone(),
                 git_ignore: base_ignores.clone(),
+                jj_ignore: GitIgnoreFile::empty(),
                 file_states: self.file_states.all(),
             };
             // Here we use scope as a queue of per-directory jobs.
@@ -1615,6 +1616,7 @@ struct DirectoryToVisit<'a> {
     dir: RepoPathBuf,
     disk_dir: PathBuf,
     git_ignore: Arc<GitIgnoreFile>,
+    jj_ignore: Arc<GitIgnoreFile>,
     file_states: FileStates<'a>,
 }
 
@@ -1685,10 +1687,12 @@ impl FileSnapshotter<'_> {
             dir,
             disk_dir,
             git_ignore,
+            jj_ignore,
             file_states,
         } = directory_to_visit;
 
         let git_ignore = git_ignore.chain_with_file(&dir, disk_dir.join(".gitignore"))?;
+        let jj_ignore = jj_ignore.chain_with_file(&dir, disk_dir.join(".jjignore"))?;
         let dir_entries: Vec<_> = disk_dir
             .read_dir()
             .and_then(|entries| entries.try_collect())
@@ -1702,7 +1706,7 @@ impl FileSnapshotter<'_> {
             // sequential scan should be fast enough.
             .with_min_len(100)
             .filter_map(|entry| {
-                self.process_dir_entry(&dir, &git_ignore, file_states, &entry, scope)
+                self.process_dir_entry(&dir, &git_ignore, &jj_ignore, file_states, &entry, scope)
                     .block_on()
                     .transpose()
             })
@@ -1713,7 +1717,7 @@ impl FileSnapshotter<'_> {
             })
             .collect::<Result<_, _>>()?;
         let present_entries = PresentDirEntries { dirs, files };
-        self.emit_deleted_files(&dir, file_states, &present_entries);
+        self.emit_deleted_files(&dir, file_states, &present_entries, &jj_ignore);
         Ok(())
     }
 
@@ -1721,6 +1725,7 @@ impl FileSnapshotter<'_> {
         &'scope self,
         dir: &RepoPath,
         git_ignore: &Arc<GitIgnoreFile>,
+        jj_ignore: &Arc<GitIgnoreFile>,
         file_states: FileStates<'scope>,
         entry: &DirEntry,
         scope: &rayon::Scope<'scope>,
@@ -1766,6 +1771,14 @@ impl FileSnapshotter<'_> {
                 }
             }
 
+            if jj_ignore.matches_dir(&path) {
+                // .jjignore skips the entire directory - both tracked and
+                // untracked files. Unlike .gitignore, already-tracked files
+                // are NOT visited. This means jj will not detect changes to
+                // files in directories matched by .jjignore.
+                return Ok(None);
+            }
+
             if git_ignore.matches_dir(&path)
                 && self.force_tracking_matcher.visit(&path).is_nothing()
             {
@@ -1782,6 +1795,7 @@ impl FileSnapshotter<'_> {
                     dir: path,
                     disk_dir,
                     git_ignore: git_ignore.clone(),
+                    jj_ignore: jj_ignore.clone(),
                     file_states,
                 };
                 self.spawn_ok(scope, |scope| {
@@ -1795,7 +1809,12 @@ impl FileSnapshotter<'_> {
             if let Some(progress) = self.progress {
                 progress(&path);
             }
-            if maybe_current_file_state.is_none()
+            if jj_ignore.matches_file(&path) {
+                // .jjignore skips the file entirely - both tracked and
+                // untracked. Unlike .gitignore, already-tracked files
+                // are also skipped.
+                Ok(None)
+            } else if maybe_current_file_state.is_none()
                 && (git_ignore.matches_file(&path) && !self.force_tracking_matcher.matches(&path))
             {
                 // If it wasn't already tracked and it matches
@@ -1984,6 +2003,7 @@ impl FileSnapshotter<'_> {
         dir: &RepoPath,
         file_states: FileStates<'_>,
         present_entries: &PresentDirEntries,
+        jj_ignore: &Arc<GitIgnoreFile>,
     ) {
         let file_state_chunks = file_states.iter().chunk_by(|(path, _state)| {
             // Extract <name> from <dir>, <dir>/<name>, or <dir>/<name>/**.
@@ -2003,9 +2023,24 @@ impl FileSnapshotter<'_> {
                 PresentDirEntryKind::Dir => !present_entries.dirs.contains(name),
                 PresentDirEntryKind::File => !present_entries.files.contains(name),
             })
+            // Skip entire directory groups matched by .jjignore at the group
+            // level. This avoids iterating over hundreds of thousands of
+            // file_state entries inside matched directories.
+            .filter(|&((kind, name), _)| match kind {
+                PresentDirEntryKind::Dir => {
+                    let path: RepoPathBuf = if dir.is_root() {
+                        RepoPathBuf::from_internal_string(name).unwrap()
+                    } else {
+                        dir.join(RepoPathComponent::new(name).unwrap())
+                    };
+                    !jj_ignore.matches_dir(&path)
+                }
+                PresentDirEntryKind::File => true,
+            })
             .flat_map(|(_, chunk)| chunk)
             // Whether or not the entry exists, submodule should be ignored
             .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
+            .filter(|(path, _)| !jj_ignore.matches_file(path))
             .filter(|(path, _)| self.matcher.matches(path))
             .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
             .ok();

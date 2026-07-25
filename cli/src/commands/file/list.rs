@@ -12,8 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
+use futures::AsyncReadExt as _;
+use jj_lib::backend::TreeValue;
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::matchers::EverythingMatcher;
+use jj_lib::repo_path::RepoPath;
+use jj_lib::repo_path::RepoPathBuf;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -55,6 +63,10 @@ pub(crate) struct FileListArgs {
     #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
     #[arg(add = ArgValueCompleter::new(complete::all_revision_files))]
     paths: Vec<String>,
+
+    /// Exclude files matched by .jjignore patterns
+    #[arg(long)]
+    exclude_by_jjignore: bool,
 }
 
 #[instrument(skip_all)]
@@ -83,7 +95,53 @@ pub(crate) async fn cmd_file_list(
 
     ui.request_pager();
     let mut formatter = ui.stdout_formatter();
+
+    let jj_ignore = if args.exclude_by_jjignore {
+        let mut ignore = GitIgnoreFile::empty();
+        // Chain workspace root .jjignore from the filesystem (may be
+        // untracked, so it is not in the tree).
+        let root_jjignore = workspace_command.workspace_root().join(".jjignore");
+        ignore = ignore.chain_with_file(RepoPath::root(), root_jjignore)?;
+        // Chain all .jjignore files from the tree (for subdirectories).
+        // Use EverythingMatcher so user-supplied path filters don't
+        // prevent loading subdirectory .jjignore files.
+        for (path, _value) in tree.entries_matching(&EverythingMatcher) {
+            if path.as_internal_file_string().ends_with("/.jjignore") {
+                let parent = RepoPathBuf::from_internal_string(
+                    path.as_internal_file_string()
+                        .strip_suffix("/.jjignore")
+                        .unwrap_or(""),
+                )
+                .unwrap_or(RepoPathBuf::root());
+                let value = tree.path_value(&path).await?;
+                if value.is_resolved() {
+                    if let Some(TreeValue::File { id, .. }) =
+                        value.iter().flatten().next().cloned()
+                    {
+                        let mut reader = tree.store().read_file(&path, &id).await?;
+                        let mut content = Vec::new();
+                        reader.read_to_end(&mut content).await?;
+                        let fake_path = workspace_command
+                            .workspace_root()
+                            .join(path.as_internal_file_string());
+                        ignore = ignore.chain(&parent, &fake_path, &content)?;
+                    }
+                }
+            }
+        }
+        Some(Arc::new(ignore))
+    } else {
+        None
+    };
+
     for (path, value) in tree.entries_matching(matcher.as_ref()) {
+        if let Some(ref ignore) = jj_ignore {
+            if ignore.matches_file(&path)
+                || path.ancestors().any(|parent| ignore.matches_dir(&parent))
+            {
+                continue;
+            }
+        }
         let entry = TreeEntry {
             path,
             value: value?,

@@ -3173,3 +3173,131 @@ fn test_always_store_empty_tree() -> TestResult {
     assert!(empty_tree.data.is_empty());
     Ok(())
 }
+
+#[test]
+fn test_jjignore() -> TestResult {
+    // Tests that .jjignore files cause jj to skip scanning matched paths
+    // entirely, including already-tracked files.
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    std::fs::create_dir(workspace_root.join("skip_dir"))?;
+    testutils::write_working_copy_file(&workspace_root, repo_path(".jjignore"), "skip_dir/\n");
+    testutils::write_working_copy_file(&workspace_root, repo_path("skip_dir/file"), "1");
+    testutils::write_working_copy_file(&workspace_root, repo_path("normal_file"), "1");
+
+    let tree = test_workspace.snapshot()?;
+    let files: Vec<RepoPathBuf> =
+        vec![repo_path(".jjignore").to_owned(), repo_path("normal_file").to_owned()];
+    assert_eq!(
+        tree.entries().map(|(name, _value)| name).collect_vec(),
+        files,
+    );
+    Ok(())
+}
+
+#[test]
+fn test_jjignore_already_tracked() -> TestResult {
+    // Tests that .jjignore causes already-tracked files to be skipped during
+    // snapshot, preserving their previous state.
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    let repo = test_workspace.repo.clone();
+
+    testutils::write_working_copy_file(&workspace_root, repo_path("normal_file"), "1");
+    testutils::write_working_copy_file(&workspace_root, repo_path("skip_file"), "1");
+    std::fs::create_dir(workspace_root.join("skip_dir"))?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("skip_dir/file"), "1");
+
+    let tree = test_workspace.snapshot()?;
+    let initial_files: Vec<RepoPathBuf> = vec![
+        repo_path("normal_file").to_owned(),
+        repo_path("skip_dir/file").to_owned(),
+        repo_path("skip_file").to_owned(),
+    ];
+    assert_eq!(
+        tree.entries().map(|(name, _value)| name).collect_vec(),
+        initial_files,
+    );
+
+    testutils::write_working_copy_file(
+        &workspace_root,
+        repo_path(".jjignore"),
+        "skip_file\nskip_dir/\n",
+    );
+    testutils::write_working_copy_file(&workspace_root, repo_path("skip_file"), "2");
+    testutils::write_working_copy_file(&workspace_root, repo_path("skip_dir/file"), "2");
+    testutils::write_working_copy_file(&workspace_root, repo_path("normal_file"), "2");
+
+    let tree = test_workspace.snapshot()?;
+    let expected = create_tree_with(&repo, |builder| {
+        builder.file(repo_path(".jjignore"), "skip_file\nskip_dir/\n");
+        builder.file(repo_path("normal_file"), "2");
+        builder.file(repo_path("skip_file"), "1");
+        builder.file(repo_path("skip_dir/file"), "1");
+    });
+    assert_tree_eq!(tree, expected);
+
+    Ok(())
+}
+
+#[test]
+fn test_jjignore_deeply_nested() -> TestResult {
+    // Tests that .jjignore correctly preserves deeply nested tracked files
+    // when a parent directory is matched.
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    let repo = test_workspace.repo.clone();
+
+    std::fs::create_dir_all(workspace_root.join("deep/nested/dir"))?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("deep/nested/dir/file"), "1");
+
+    let tree = test_workspace.snapshot()?;
+    assert!(tree
+        .entries()
+        .any(|(p, _)| *p == *repo_path("deep/nested/dir/file")));
+
+    testutils::write_working_copy_file(&workspace_root, repo_path(".jjignore"), "deep/\n");
+    testutils::write_working_copy_file(&workspace_root, repo_path("deep/nested/dir/file"), "2");
+
+    let tree = test_workspace.snapshot()?;
+    let expected = create_tree_with(&repo, |builder| {
+        builder.file(repo_path(".jjignore"), "deep/\n");
+        builder.file(repo_path("deep/nested/dir/file"), "1");
+    });
+    assert_tree_eq!(tree, expected);
+
+    Ok(())
+}
+
+#[test]
+fn test_jjignore_nested() -> TestResult {
+    // Tests that nested .jjignore files work in subdirectories.
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    std::fs::create_dir_all(workspace_root.join("subdir"))?;
+    testutils::write_working_copy_file(
+        &workspace_root,
+        repo_path("subdir/.jjignore"),
+        "nested_skip/\n",
+    );
+    std::fs::create_dir_all(workspace_root.join("subdir/nested_skip"))?;
+    testutils::write_working_copy_file(
+        &workspace_root,
+        repo_path("subdir/nested_skip/file"),
+        "1",
+    );
+    testutils::write_working_copy_file(&workspace_root, repo_path("subdir/visible"), "1");
+
+    let tree = test_workspace.snapshot()?;
+    let files: Vec<RepoPathBuf> = vec![
+        repo_path("subdir/.jjignore").to_owned(),
+        repo_path("subdir/visible").to_owned(),
+    ];
+    assert_eq!(
+        tree.entries().map(|(name, _value)| name).collect_vec(),
+        files,
+    );
+    Ok(())
+}
