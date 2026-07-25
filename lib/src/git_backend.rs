@@ -416,6 +416,11 @@ impl GitBackend {
         self.base_repo.path()
     }
 
+    /// Path to the Git executable used for subprocess operations.
+    pub fn git_executable(&self) -> &Path {
+        &self.git_executable
+    }
+
     fn shallow_root_ids(&self, git_repo: &gix::Repository) -> BackendResult<&[CommitId]> {
         // The list of shallow roots is cached by gix, but it's still expensive
         // to stat file on every read_object() call. Refreshing shallow roots is

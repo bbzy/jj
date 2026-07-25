@@ -1387,15 +1387,23 @@ fn test_colocated_workspace_update_stale() {
     │ ○  f562bf82f2da default@
     ├─╯
     ○  30ed2f28b710
+    │ ○  7fe3ff3b9a60 book2 "book2"
+    ├─╯
     │ ○  e97ad7861f78 book1 "new book1"
     ├─╯
     │ ○  f656b467890b "old book1"
     ├─╯
     ◆  000000000000
     [EOF]
+    ------- stderr -------
+    Done importing changes from the underlying Git repo.
+    [EOF]
     "#);
 
-    // The main workspace's working copy is now stale.
+    // The main workspace's working copy is now stale. The secondary
+    // workspace's own HEAD must not leak into the repo-wide git_head: `jj st`
+    // in the main workspace reports the staleness instead of "recovering" to
+    // a divergent parent.
     let output = main_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
@@ -1406,9 +1414,9 @@ fn test_colocated_workspace_update_stale() {
     [exit status: 1]
     ");
 
-    // Before the fix, this would fail with the same "working copy is stale" error
-    // because the colocated repo reload logic would reload to HEAD before
-    // snapshotting, breaking the recovery.
+    // Before the fix, this would fail with the same "working copy is stale"
+    // error because the colocated repo reload logic would reload to HEAD
+    // before snapshotting, breaking the recovery.
     let output = main_dir.run_jj(["workspace", "update-stale"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
@@ -1416,7 +1424,6 @@ fn test_colocated_workspace_update_stale() {
     Parent commit (@-)      : qpvuntsm 30ed2f28 (no description set)
     Added 0 files, modified 1 files, removed 0 files
     Updated working copy to fresh commit f562bf82f2da
-    Done importing changes from the underlying Git repo.
     [EOF]
     ");
 
@@ -1446,6 +1453,257 @@ fn test_colocated_workspace_update_stale() {
     ◆  000000000000
     [EOF]
     "#);
+}
+
+/// Test that bookmark changes made in a secondary workspace are exported to
+/// the underlying Git repo, keeping refs/heads/* and the @git tracking
+/// bookmarks in sync (e.g. after `jj git push`).
+#[test]
+fn test_secondary_workspace_exports_git_refs() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    let git_repo = git::open(main_dir.root());
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.run_jj(["bookmark", "create", "-r@-", "book1"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    // Move the bookmark forward from the secondary workspace.
+    secondary_dir.write_file("file", "changed in secondary\n");
+    secondary_dir.run_jj(["squash", "--into", "book1"]).success();
+    secondary_dir.run_jj(["new", "book1"]).success();
+
+    // The Git ref should have been exported by the secondary workspace, and
+    // the @git tracking bookmark should be in sync (no "behind by" lag).
+    let output = secondary_dir.run_jj(["bookmark", "list", "--all", "book1"]);
+    insta::assert_snapshot!(output, @r"
+    book1: qpvuntsm 9957cd26 initial
+      @git: qpvuntsm 9957cd26 initial
+    [EOF]
+    ");
+
+    let book1_commit_id = format!(
+        "{:?}",
+        secondary_dir
+            .run_jj(["log", "-r", "book1", "--no-graph", "-T", "commit_id"])
+            .success()
+            .stdout
+    );
+    assert_eq!(
+        git_repo.find_reference("refs/heads/book1")?.id().to_string(),
+        book1_commit_id.trim().trim_matches('"'),
+    );
+
+    Ok(())
+}
+
+/// Test that a secondary worktree's own HEAD is not imported into the
+/// repo-wide git_head. The main and secondary workspaces usually have
+/// different Git HEADs (each synced to its own @-); if the worktree's HEAD
+/// were fed to import_head(), every command alternating between the two
+/// workspaces would spuriously "import git head" and reset the working copy.
+#[test]
+fn test_secondary_workspace_head_does_not_clobber_git_head() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "c1"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    // Diverge the workspaces' @-, so their Git HEADs differ.
+    main_dir.write_file("file", "changed in main\n");
+    main_dir.run_jj(["commit", "-m", "c2"]).success();
+
+    // Alternating commands must not produce "import git head" operations or
+    // working-copy resets.
+    for dir in [&main_dir, &secondary_dir, &main_dir, &secondary_dir] {
+        let output = dir.run_jj(["st"]);
+        let stderr = output.stderr.raw();
+        assert!(
+            !stderr.contains("Reset the working copy parent to the new Git HEAD"),
+            "spurious git HEAD import in {}: {stderr}",
+            dir.root().display(),
+        );
+    }
+    Ok(())
+}
+
+/// Test that a secondary workspace backed by a fallback `gitdir:` pointer
+/// (written when `git worktree add` fails, e.g. on an unborn HEAD) does not
+/// touch the main repo's HEAD or index. The fallback shares the main repo's
+/// git dir, so HEAD/index syncs from the secondary would corrupt the main
+/// workspace's Git state.
+#[test]
+fn test_fallback_gitdir_pointer_workspace_preserves_main_head() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    // `git worktree add` fails on an unborn HEAD, so jj falls back to a raw
+    // gitdir pointer sharing the main repo's git dir.
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let dot_git = std::fs::read_to_string(secondary_dir.root().join(".git"))?;
+    let gitdir = dot_git.trim().strip_prefix("gitdir:").unwrap().trim();
+    assert_eq!(
+        dunce::canonicalize(gitdir)?,
+        dunce::canonicalize(main_dir.root().join(".git"))?,
+        "expected fallback gitdir pointer, got: {dot_git}"
+    );
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "c1"]).success();
+    let git_repo = git::open(main_dir.root());
+    let main_head_before = git_repo.head_id()?.to_string();
+
+    // Commit in the secondary workspace.
+    secondary_dir.write_file("other", "from secondary\n");
+    secondary_dir.run_jj(["commit", "-m", "secondary work"]).success();
+
+    // The main repo's HEAD and index must be untouched.
+    assert_eq!(
+        git_repo.head_id()?.to_string(),
+        main_head_before,
+        "secondary workspace must not move the main repo's HEAD"
+    );
+    let output = std::process::Command::new("git")
+        .current_dir(main_dir.root())
+        .args(["status", "--porcelain=v1"])
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "",
+        "main workspace's git index must not be clobbered by the secondary"
+    );
+    Ok(())
+}
+
+/// Test that bookmark changes made in a secondary workspace of a
+/// non-colocated (clone-style) repo are exported to the backing Git store.
+/// The linked worktree's `.git` file points into `.jj/repo/store/git`, which
+/// the worktree detection must recognize.
+#[test]
+fn test_clone_style_secondary_workspace_exports_git_refs() -> TestResult {
+    let test_env = TestEnvironment::default();
+    let origin_repo = git::init(test_env.env_root().join("origin"));
+    git::add_commit(
+        &origin_repo,
+        "refs/heads/main",
+        "file",
+        b"contents\n",
+        "initial",
+        &[],
+    );
+    git::set_symbolic_reference(&origin_repo, "HEAD", "refs/heads/main");
+    test_env
+        .run_jj_in(".", ["git", "clone", "origin", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["new", "-m", "initial"]).success();
+    main_dir.run_jj(["bookmark", "create", "-r@", "book1"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    secondary_dir.write_file("file", "changed in secondary\n");
+    secondary_dir.run_jj(["squash", "--into", "book1"]).success();
+    secondary_dir.run_jj(["new", "book1"]).success();
+
+    let book1_commit_id = format!(
+        "{:?}",
+        secondary_dir
+            .run_jj(["log", "-r", "book1", "--no-graph", "-T", "commit_id"])
+            .success()
+            .stdout
+    );
+    // `jj git clone` is not colocated: the backing Git store lives in the jj
+    // repo dir, not at `<workspace>/.git`.
+    let git_repo = git::open(main_dir.root().join(".jj/repo/store/git"));
+    assert_eq!(
+        git_repo.find_reference("refs/heads/book1")?.id().to_string(),
+        book1_commit_id.trim().trim_matches('"'),
+    );
+    Ok(())
+}
+
+/// Test that the linked-worktree HEAD sync never moves an attached branch:
+/// if the user points the secondary worktree's HEAD at a branch with git,
+/// jj operations must detach the HEAD instead of force-updating the branch
+/// ref behind jj's back.
+#[test]
+fn test_secondary_workspace_attached_head_not_moved() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.run_jj(["bookmark", "create", "-r@-", "book1"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    // Attach the secondary worktree's HEAD to the book1 branch, as a plain
+    // `git checkout book1` would.
+    let git_repo = git::open(secondary_dir.root());
+    git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/book1");
+
+    // Run an operation in the secondary workspace that syncs its HEAD.
+    secondary_dir.run_jj(["new", "-m", "secondary work"]).success();
+
+    // refs/heads/book1 must not have been force-moved by the HEAD sync.
+    let book1_commit_id = format!(
+        "{:?}",
+        secondary_dir
+            .run_jj(["log", "-r", "book1", "--no-graph", "-T", "commit_id"])
+            .success()
+            .stdout
+    );
+    assert_eq!(
+        git_repo.find_reference("refs/heads/book1")?.id().to_string(),
+        book1_commit_id.trim().trim_matches('"'),
+    );
+    // The worktree's HEAD is detached at the working copy's parent.
+    let parent_commit_id = format!(
+        "{:?}",
+        secondary_dir
+            .run_jj(["log", "-r", "@-", "--no-graph", "-T", "commit_id"])
+            .success()
+            .stdout
+    );
+    assert_eq!(
+        git_repo.find_reference("HEAD")?.id().to_string(),
+        parent_commit_id.trim().trim_matches('"'),
+    );
+    Ok(())
 }
 
 /// Test forgetting workspaces
@@ -2113,4 +2371,658 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     )
     "#;
     work_dir.run_jj(["log", "-T", template, "-r", "all()"])
+}
+
+/// Test that `jj workspace add` creates `.jj/.gitignore` in the new workspace
+/// so that git doesn't track jj's internal state.
+#[test]
+fn test_workspace_add_creates_jj_gitignore() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../secondary"])
+        .success();
+    let secondary_dir = test_env.work_dir("secondary");
+
+    // .jj/.gitignore should exist with content "/*\n"
+    let gitignore_path = secondary_dir.root().join(".jj").join(".gitignore");
+    assert!(
+        gitignore_path.exists(),
+        ".jj/.gitignore should exist in the new workspace"
+    );
+    let content = std::fs::read_to_string(&gitignore_path)?;
+    assert_eq!(
+        content, "/*\n",
+        ".jj/.gitignore should contain '/*\\n' to ignore all files in .jj"
+    );
+
+    Ok(())
+}
+
+/// Test that `git status` is clean after `jj workspace add`.
+///
+/// The workspace should have a proper git worktree (not just a gitdir pointer)
+/// with its own index, and `git update-index --refresh` should have been run
+/// so that git doesn't show spurious modifications.
+#[test]
+fn test_workspace_add_git_status_clean() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../secondary"])
+        .success();
+    let secondary_dir = test_env.work_dir("secondary");
+
+    // The workspace should have a .git file (linked worktree), not a bare
+    // gitdir: pointer. A linked worktree's .git file contains "gitdir: <path>"
+    // pointing to the main repo's worktree directory.
+    let dot_git = secondary_dir.root().join(".git");
+    assert!(dot_git.exists(), ".git should exist in the new workspace");
+
+    // git status should be clean (no modifications).
+    let output = std::process::Command::new("git")
+        .current_dir(secondary_dir.root())
+        .args(["status", "--porcelain=v1"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "git status should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Filter out .jj/ entries — those are ignored by .jj/.gitignore.
+    let non_ignored: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.contains(".jj/"))
+        .collect();
+    assert!(
+        non_ignored.is_empty(),
+        "git status should be clean (ignoring .jj/), but found: {non_ignored:?}"
+    );
+
+    Ok(())
+}
+
+/// Test that `jj workspace add` creates a proper git worktree with its own
+/// index, not just a `gitdir:` pointer file that shares the main repo's index.
+#[test]
+fn test_workspace_add_creates_git_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../secondary"])
+        .success();
+
+    // The main repo should have a worktree registered for "secondary".
+    let output = std::process::Command::new("git")
+        .current_dir(main_dir.root())
+        .args(["worktree", "list", "--porcelain"])
+        .output()?;
+    assert!(output.status.success());
+    let worktree_list = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        worktree_list.contains("secondary"),
+        "git worktree list should contain the secondary workspace, got: {worktree_list}"
+    );
+
+    // The secondary workspace should have its own index file (not sharing
+    // the main repo's index). This is stored inside the worktree's git dir
+    // under the main repo's .git/worktrees/<name>/index.
+    // In a colocated repo, .git is a directory, not a file. The worktree's
+    // .git file points to <main>/.git/worktrees/<name>.
+    let secondary_dot_git =
+        std::fs::read_to_string(test_env.work_dir("secondary").root().join(".git"))?;
+    assert!(
+        secondary_dot_git.starts_with("gitdir: "),
+        "secondary .git should be a gitdir pointer, got: {secondary_dot_git}"
+    );
+    let worktree_gitdir = secondary_dot_git
+        .strip_prefix("gitdir: ")
+        .unwrap()
+        .trim();
+    // The worktree gitdir should be under the main repo's .git/worktrees/
+    assert!(
+        worktree_gitdir.contains("worktrees"),
+        "worktree gitdir should be under .git/worktrees/, got: {worktree_gitdir}"
+    );
+
+    // After jj checks out files, the index should exist and be valid.
+    // Running git status (which requires a valid index) should succeed.
+    let output = std::process::Command::new("git")
+        .current_dir(test_env.work_dir("secondary").root())
+        .args(["status", "--porcelain=v1"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "git status should succeed in the worktree, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the index exists by listing files.
+    let output = std::process::Command::new("git")
+        .current_dir(test_env.work_dir("secondary").root())
+        .args(["ls-files"])
+        .output()?;
+    assert!(output.status.success());
+    let files = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        files.contains("file"),
+        "git ls-files should list 'file' from the checked-out tree, got: {files}"
+    );
+
+    Ok(())
+}
+
+/// Test that `jj workspace add` creates a .git pointer in a non-colocated repo.
+///
+/// In a non-colocated repo (created with `jj git init` without `--colocate`),
+/// the git backend is a bare repo. `git worktree add` from a bare repo may
+/// fail, so jj falls back to writing a `gitdir:` pointer. Either way, the
+/// workspace should function correctly: files should be checked out and
+/// `git` commands should be able to see the repo.
+#[test]
+fn test_workspace_add_non_colocated_git_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../secondary"])
+        .success();
+    let secondary_dir = test_env.work_dir("secondary");
+
+    // The secondary workspace should have a .git file pointing to the git repo.
+    let dot_git = secondary_dir.root().join(".git");
+    assert!(dot_git.exists(), ".git should exist in secondary workspace");
+
+    let dot_git_content = std::fs::read_to_string(&dot_git)?;
+    assert!(
+        dot_git_content.starts_with("gitdir: "),
+        "secondary .git should be a gitdir pointer, got: {dot_git_content}"
+    );
+
+    // Files should be checked out in the secondary workspace.
+    assert!(
+        secondary_dir.root().join("file").exists(),
+        "file should be checked out in secondary workspace"
+    );
+    let content = secondary_dir.read_file("file");
+    assert_eq!(
+        content, "contents",
+        "file content should match in secondary workspace"
+    );
+
+    // jj should see the workspace as clean (no pending changes).
+    let output = secondary_dir.run_jj(["diff", "--summary"]);
+    assert!(
+        output.stdout.is_empty(),
+        "secondary workspace should be clean, got: {output}"
+    );
+
+    Ok(())
+}
+
+/// Test that `jj edit` in a linked worktree (non-colocated workspace) syncs
+/// the worktree's git HEAD and index, so `git status` shows correct state.
+#[test]
+fn test_workspace_edit_syncs_git_head() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    // Create commits A, B, C
+    main_dir.write_file("f1.txt", "f1");
+    main_dir.run_jj(["describe", "-m", "A"]).success();
+    main_dir.run_jj(["new", "-m", "B"]).success();
+    main_dir.write_file("f2.txt", "f2");
+    main_dir.run_jj(["describe", "-m", "B"]).success();
+    main_dir.run_jj(["new", "-m", "C"]).success();
+    main_dir.write_file("f3.txt", "f3");
+    main_dir.run_jj(["describe", "-m", "C"]).success();
+
+    // Create a workspace
+    main_dir
+        .run_jj(["workspace", "add", "--name", "ws", "../ws"])
+        .success();
+    let ws_dir = test_env.work_dir("ws");
+
+    // Get change IDs for A, B, C
+    let log_output = ws_dir.run_jj([
+        "log",
+        "-T",
+        "change_id.short() ++ \" \" ++ description.first_line() ++ \"\n\"",
+        "--no-graph",
+    ]);
+    let lines: Vec<&str> = log_output.stdout.normalized().lines().collect();
+    let commit_c = lines[1].split_whitespace().next().unwrap();
+    let commit_b = lines[2].split_whitespace().next().unwrap();
+    let commit_a = lines[3].split_whitespace().next().unwrap();
+
+    // Helper to run git in the workspace, returns (stdout, exit_code)
+    let git_rev_parse_head = || {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(ws_dir.root())
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            output.status.code().unwrap_or(-1),
+        )
+    };
+    let git_status_short = || {
+        std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(ws_dir.root())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+
+    // Edit to C — HEAD should point to B (C's parent)
+    ws_dir.run_jj(["edit", commit_c]).success();
+    let (head, code) = git_rev_parse_head();
+    let status = git_status_short();
+    assert_eq!(code, 0, "HEAD should be valid after edit to C, got: {head}");
+    assert!(
+        status.contains("f3.txt"),
+        "git status should show f3.txt, got: {status}"
+    );
+
+    // Edit to B — HEAD should point to A (B's parent)
+    ws_dir.run_jj(["edit", commit_b]).success();
+    let (head, code) = git_rev_parse_head();
+    let status = git_status_short();
+    assert_eq!(code, 0, "HEAD should be valid after edit to B, got: {head}");
+    assert!(
+        status.contains("f2.txt"),
+        "git status should show f2.txt, got: {status}"
+    );
+
+    // Edit to A — HEAD should be unborn (A's parent is root)
+    ws_dir.run_jj(["edit", commit_a]).success();
+    let (head, code) = git_rev_parse_head();
+    let status = git_status_short();
+    assert_ne!(
+        code, 0,
+        "HEAD should be unborn after edit to A (root parent), got: {head}"
+    );
+    assert!(
+        status.contains("f1.txt"),
+        "git status should show f1.txt, got: {status}"
+    );
+}
+
+/// Rewriting a linked workspace from another workspace must not make the
+/// linked worktree's stale Git HEAD look like an external `git checkout`.
+#[test_case(false, false; "same working-copy tree")]
+#[test_case(true, false; "manual stale recovery")]
+#[test_case(true, true; "automatic stale recovery")]
+fn test_linked_workspace_rebase_from_other_workspace_preserves_rewrite(
+    destination_changes_tree: bool,
+    auto_update_stale: bool,
+) -> TestResult {
+    let test_env = TestEnvironment::default();
+    if auto_update_stale {
+        test_env.add_config("snapshot.auto-update-stale = true\n");
+    }
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let workspace_a = test_env.work_dir("A");
+    let workspace_b = test_env.work_dir("B");
+
+    // Ensure `workspace add` can create proper linked Git worktrees.
+    main_dir.write_file("base", "base\n");
+    main_dir.run_jj(["commit", "-m", "base"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "A", "../A"])
+        .success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "B", "../B"])
+        .success();
+
+    if destination_changes_tree {
+        workspace_a.write_file("a", "a\n");
+    }
+    workspace_a.run_jj(["commit", "-m", "A target"]).success();
+    workspace_b.write_file("b", "b\n");
+    workspace_b.run_jj(["commit", "-m", "B commit"]).success();
+
+    let commit_id = |work_dir: &TestWorkDir, revision: &str| {
+        work_dir
+            .run_jj([
+                "log",
+                "--ignore-working-copy",
+                "--no-graph",
+                "-r",
+                revision,
+                "-T",
+                "commit_id",
+            ])
+            .success()
+            .stdout
+            .normalized()
+            .trim()
+            .to_owned()
+    };
+    let default_wc_id = commit_id(&workspace_a, "default@");
+    let old_b_parent_id = commit_id(&workspace_a, "B@-");
+
+    workspace_a.run_jj(["rebase", "-b", "B@", "-o", "@"]).success();
+    let rebased_b_parent_id = commit_id(&workspace_a, "B@-");
+    assert_ne!(old_b_parent_id, rebased_b_parent_id);
+    assert_eq!(commit_id(&workspace_a, "default@"), default_wc_id);
+
+    // A normal command must not import B's old per-worktree Git HEAD. If the
+    // destination changed the tree, the command should report a stale working
+    // copy; otherwise it can synchronize the metadata automatically.
+    let output = workspace_b.run_jj(["status"]);
+    assert!(
+        !output
+            .stderr
+            .normalized()
+            .contains("Reset the working copy parent to the new Git HEAD"),
+        "stale Git HEAD should not be imported: {output}"
+    );
+    if destination_changes_tree && !auto_update_stale {
+        assert!(!output.status.success(), "command should fail: {output}");
+        assert!(
+            output.stderr.normalized().contains("working copy is stale"),
+            "unexpected error: {output}"
+        );
+        workspace_b.run_jj(["workspace", "update-stale"]).success();
+    } else {
+        output.success();
+    }
+    assert_eq!(commit_id(&workspace_b, "@-"), rebased_b_parent_id);
+    let divergent = workspace_b
+        .run_jj([
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            "divergent()",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .success();
+    assert!(
+        divergent.stdout.is_empty(),
+        "rewrite should not become divergent: {divergent}"
+    );
+
+    let git_head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_b.root())
+        .output()?;
+    assert!(git_head.status.success());
+    assert_eq!(
+        String::from_utf8(git_head.stdout)?.trim(),
+        rebased_b_parent_id
+    );
+
+    Ok(())
+}
+
+/// Rewriting the parent of a linked workspace's working-copy commit must also
+/// refresh that worktree's private Git index. This is easy to miss because the
+/// worktree HEAD can be correct while `git status` still compares against an
+/// index left behind by an earlier checkout.
+#[test]
+fn test_workspace_restore_into_then_new_syncs_git_index() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir.write_file("file", "base\n");
+    main_dir.run_jj(["commit", "-m", "base"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "ws", "../ws"])
+        .success();
+    let ws_dir = test_env.work_dir("ws");
+
+    ws_dir.write_file("file", "updated\n");
+    ws_dir.run_jj(["restore", "--into", "@-"]).success();
+    ws_dir.run_jj(["new"]).success();
+
+    let head_tree = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD^{tree}"])
+        .current_dir(ws_dir.root())
+        .output()
+        .unwrap();
+    assert!(head_tree.status.success());
+    let index_tree = std::process::Command::new("git")
+        .args(["write-tree"])
+        .current_dir(ws_dir.root())
+        .output()
+        .unwrap();
+    assert!(index_tree.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&index_tree.stdout).trim(),
+        String::from_utf8_lossy(&head_tree.stdout).trim(),
+        "linked worktree index should match HEAD after restore --into and new"
+    );
+
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1"])
+        .current_dir(ws_dir.root())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+}
+
+#[test]
+fn test_linked_workspace_locked_index_does_not_move_git_head() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "base\n");
+    main_dir.run_jj(["commit", "-m", "base"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "ws", "../ws"])
+        .success();
+    let ws_dir = test_env.work_dir("ws");
+
+    // Create a target whose tree differs from the linked workspace's current
+    // parent, so switching to it must update the Git index.
+    main_dir.write_file("file", "target\n");
+    main_dir.run_jj(["commit", "-m", "target"]).success();
+    main_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "target"])
+        .success();
+
+    let old_head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(ws_dir.root())
+        .output()?;
+    let index_lock = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "index.lock"])
+        .current_dir(ws_dir.root())
+        .output()?;
+    let index_lock = String::from_utf8(index_lock.stdout)?.trim().to_owned();
+    std::fs::write(&index_lock, [])?;
+
+    let output = ws_dir.run_jj(["new", "-r", "target"]);
+    assert!(!output.status.success(), "command should fail: {output}");
+    assert!(
+        output
+            .stderr
+            .normalized()
+            .contains("Failed to update the linked Git worktree index: fatal: Unable to create"),
+        "unexpected error: {output}"
+    );
+
+    let new_head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(ws_dir.root())
+        .output()?;
+    assert_eq!(new_head.stdout, old_head.stdout, "Git HEAD must not move");
+
+    std::fs::remove_file(index_lock)?;
+    Ok(())
+}
+
+/// Metadata-only working-copy changes must not refresh every tracked file in
+/// the linked worktree index. In particular, `new` and abandoning that empty
+/// commit have identical trees and should not invoke clean filters.
+#[test]
+fn test_linked_workspace_empty_new_and_abandon_skip_clean_filter() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("tracked.filter", "contents\n");
+    main_dir.write_file(".gitattributes", "*.filter filter=fail\n");
+    main_dir.run_jj(["commit", "-m", "base"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "ws", "../ws"])
+        .success();
+    let ws_dir = test_env.work_dir("ws");
+
+    // If `git add -u` runs, this clean filter changes the index blob. The
+    // linked-worktree index sync uses `git read-tree`, which doesn't invoke
+    // clean filters, so the index must remain identical to HEAD.
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws_dir.root())
+            .output()
+            .unwrap()
+    };
+    assert!(
+        run_git(&["config", "filter.fail.clean", "printf filtered"])
+            .status
+            .success()
+    );
+    assert!(
+        run_git(&["config", "filter.fail.required", "true"])
+            .status
+            .success()
+    );
+
+    ws_dir.run_jj(["new"]).success();
+    assert!(run_git(&["diff", "--cached", "--quiet"]).status.success());
+    ws_dir.run_jj(["abandon", "@"]).success();
+    assert!(run_git(&["diff", "--cached", "--quiet"]).status.success());
+    Ok(())
+}
+
+/// Refreshing the linked-worktree index after checkout must be limited to the
+/// paths actually touched by that checkout. An unrestricted `git add -u`
+/// would clean every entry whose stat data was reset by `git read-tree`.
+#[test]
+fn test_linked_workspace_checkout_refreshes_only_changed_paths() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let clean_marker = test_env.env_root().join("unrelated-clean-ran");
+    let clean_script = test_env.env_root().join("count-clean.sh");
+    std::fs::write(
+        &clean_script,
+        format!(
+            "count=0\nif test -f {0}; then count=$(cat {0}); fi\nexpr \"$count\" + 1 > {0}\ncat\n",
+            clean_marker.display()
+        ),
+    )?;
+    let clean_command = format!("sh {}", clean_script.display());
+    let config_filter = std::process::Command::new("git")
+        .args(["config", "filter.fail.clean", &clean_command])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(config_filter.status.success());
+    let config_required = std::process::Command::new("git")
+        .args(["config", "filter.fail.required", "true"])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(config_required.status.success());
+    main_dir.write_file("tracked.filter", "contents\n");
+    main_dir.write_file("changed.txt", "base\n");
+    main_dir.write_file(".gitattributes", "*.filter filter=fail\n");
+    main_dir.run_jj(["commit", "-m", "base"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "ws", "../ws"])
+        .success();
+    let ws_dir = test_env.work_dir("ws");
+
+    main_dir.write_file("changed.txt", "target\n");
+    main_dir.run_jj(["commit", "-m", "target"]).success();
+    main_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "target"])
+        .success();
+
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws_dir.root())
+            .output()
+            .unwrap()
+    };
+    // Establish clean file-state metadata. Move the tree-state mtime into the
+    // future so the next snapshot deterministically considers tracked.filter
+    // clean instead of re-reading it when the mtimes happen to be equal.
+    ws_dir.run_jj(["status"]).success();
+    assert!(
+        clean_marker.exists(),
+        "test setup should have invoked the clean filter"
+    );
+    let tracked_mtime = std::fs::metadata(ws_dir.root().join("tracked.filter"))?.modified()?;
+    let tree_state = std::fs::File::options()
+        .write(true)
+        .open(ws_dir.root().join(".jj/working_copy/tree_state"))?;
+    tree_state.set_modified(tracked_mtime + std::time::Duration::from_secs(10))?;
+    std::fs::remove_file(&clean_marker)?;
+
+    // If post-checkout `git add -u` is unrestricted, it will clean the
+    // unchanged filtered path and recreate this marker.
+    ws_dir.run_jj(["new", "-r", "target"]).success();
+    assert_eq!(ws_dir.read_file("changed.txt"), "target\n");
+    assert!(
+        !clean_marker.exists(),
+        "checkout must not clean an unchanged filtered path"
+    );
+    let cached_diff = run_git(&["diff", "--cached", "--name-status"]);
+    assert!(
+        cached_diff.status.success() && cached_diff.stdout.is_empty(),
+        "unchanged filtered paths must not be cleaned into the index: {}",
+        String::from_utf8_lossy(&cached_diff.stdout)
+    );
+    Ok(())
 }

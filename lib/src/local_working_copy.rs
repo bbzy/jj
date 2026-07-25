@@ -2543,6 +2543,11 @@ impl TreeState {
             added_files: added_stats.added_files,
             removed_files: removed_stats.removed_files,
             skipped_files: added_stats.skipped_files,
+            changed_paths: added_stats
+                .changed_paths
+                .into_iter()
+                .chain(removed_stats.changed_paths)
+                .collect(),
         })
     }
 
@@ -2559,6 +2564,7 @@ impl TreeState {
             added_files: 0,
             removed_files: 0,
             skipped_files: 0,
+            changed_paths: Vec::new(),
         };
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
@@ -2918,6 +2924,7 @@ impl TreeState {
                         .await?
                 }
             };
+            stats.changed_paths.push(path.clone());
             changed_file_states.push((path, file_state));
             Ok(())
         };

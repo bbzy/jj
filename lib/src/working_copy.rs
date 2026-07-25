@@ -281,6 +281,13 @@ pub struct CheckoutStats {
     /// working copy but were skipped because there was an untracked (probably
     /// ignored) file in its place.
     pub skipped_files: u32,
+    /// Paths that were successfully updated or added on disk.
+    ///
+    /// Unlike the counters above, this excludes paths that were skipped. This
+    /// can be used by integrations which need to refresh metadata only for
+    /// files actually written by the checkout. Removed paths are excluded
+    /// because they have no on-disk metadata to refresh.
+    pub changed_paths: Vec<RepoPathBuf>,
 }
 
 /// The working-copy checkout failed.

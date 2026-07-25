@@ -108,7 +108,11 @@ pub async fn cmd_git(
 }
 
 pub fn maybe_add_gitignore(workspace_command: &WorkspaceCommandHelper) -> Result<(), CommandError> {
-    if workspace_command.working_copy_shared_with_git() {
+    // Write .jj/.gitignore whenever the workspace has a .git file or
+    // directory, so that git doesn't track jj's internal state. This
+    // covers both colocated workspaces and non-colocated workspaces
+    // (e.g. created via `jj workspace add`) that have a .git pointer.
+    if workspace_command.workspace_root().join(".git").exists() {
         std::fs::write(
             workspace_command
                 .workspace_root()

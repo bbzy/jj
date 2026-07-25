@@ -373,6 +373,86 @@ impl Workspace {
         working_copy_factory: &dyn WorkingCopyFactory,
         workspace_name: WorkspaceNameBuf,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
+        // If the repo has a git backend and this workspace is not
+        // colocated with it, create a linked git worktree so users can
+        // run git commands directly in the workspace root.
+        //
+        // This must happen *before* creating `.jj` because `git worktree
+        // add` refuses to create a worktree in a non-empty directory.
+        // Falls back to manually writing a gitdir: pointer file if git
+        // worktree add fails.
+        #[cfg(feature = "git")]
+        if let Ok(backend) = crate::git::get_git_backend(repo.store()) {
+            let is_colocated = backend.git_repo().workdir().is_some_and(|w| {
+                w == workspace_root
+                    || dunce::canonicalize(w).ok().as_deref()
+                        == dunce::canonicalize(workspace_root).ok().as_deref()
+            });
+            if !is_colocated {
+                let git_dir = backend.git_repo_path();
+                // Use --no-checkout so git doesn't write files to disk.
+                // jj's checkout will handle file creation. This avoids
+                // conflicts when jj tries to write files that git already
+                // created, and avoids unnecessary smudge filter processing.
+                let output = match (git_dir.to_str(), workspace_root.to_str()) {
+                    (Some(g), Some(w)) => Some(
+                        std::process::Command::new(backend.git_executable())
+                            .args([
+                                "--git-dir", g,
+                                "worktree", "add", "--force", "--no-checkout",
+                                w, "HEAD",
+                            ])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .output()
+                    ),
+                    _ => {
+                        tracing::warn!(
+                            git_dir = %git_dir.display(),
+                            workspace_root = %workspace_root.display(),
+                            "git worktree add: path contains non-UTF-8; falling back to gitdir: pointer"
+                        );
+                        let pointer = format!("gitdir: {}\n", git_dir.display());
+                        let _ = std::fs::write(workspace_root.join(".git"), &pointer).ok();
+                        None
+                    }
+                };
+                if let Some(Ok(output)) = output {
+                    let success = output.status.success();
+                    if !success {
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        tracing::warn!(
+                            workspace_root = %workspace_root.display(),
+                            git_dir = %git_dir.display(),
+                            stderr = %stderr,
+                            "git worktree add failed; falling back to gitdir: pointer"
+                        );
+                        let pointer = format!("gitdir: {}\n", git_dir.display());
+                        let _ = std::fs::write(workspace_root.join(".git"), &pointer).ok();
+                    } else {
+                        // Populate the index from HEAD without checking out
+                        // files. This gives the worktree its own index so
+                        // `git status` works correctly after jj's checkout.
+                        let rt_status = std::process::Command::new(backend.git_executable())
+                            .args(["read-tree", "HEAD"])
+                            .current_dir(workspace_root)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .status();
+                        if let Err(err) = &rt_status {
+                            tracing::warn!(
+                                workspace_root = %workspace_root.display(),
+                                error = %err,
+                                "git read-tree HEAD failed; git status may not work correctly"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let jj_dir = create_jj_dir(workspace_root)?;
 
         let repo_dir = dunce::canonicalize(repo_path).context(repo_path)?;
@@ -404,6 +484,7 @@ impl Workspace {
             repo.loader().clone(),
         )?;
         workspace_store.add(workspace.workspace_name(), workspace.workspace_root())?;
+
         Ok((workspace, repo))
     }
 
@@ -432,6 +513,139 @@ impl Workspace {
 
     pub fn repo_loader(&self) -> &RepoLoader {
         &self.repo_loader
+    }
+
+    /// Resolves the git dir this workspace's `.git` points to, if the
+    /// workspace root contains a `gitdir:` pointer file (either a proper
+    /// linked worktree created by `git worktree add`, or the fallback
+    /// pointer written by `jj workspace add` when `git worktree add` failed).
+    fn linked_git_pointer(&self) -> Option<PathBuf> {
+        let dot_git = self.workspace_root().join(".git");
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let pointer = content.trim().strip_prefix("gitdir:")?.trim();
+        // Relative pointers are relative to the workspace root, not the
+        // process CWD.
+        let pointer = if Path::new(pointer).is_absolute() {
+            PathBuf::from(pointer)
+        } else {
+            self.workspace_root().join(pointer)
+        };
+        Some(dunce::canonicalize(&pointer).unwrap_or(pointer))
+    }
+
+    /// True if this workspace is a proper git linked worktree: its `.git` is a
+    /// file pointing to `<git_dir>/worktrees/<name>`, so the worktree has its
+    /// own per-worktree HEAD and index.
+    ///
+    /// Besides the `worktrees/` parent directory, the target must look like a
+    /// worktree gitdir (it contains `commondir` and `gitdir` marker files
+    /// written by `git worktree add`), so that an unrelated repo that merely
+    /// lives under a directory named "worktrees" isn't misdetected.
+    pub fn is_proper_linked_git_worktree(&self) -> bool {
+        let Some(gitdir) = self.linked_git_pointer() else {
+            return false;
+        };
+        gitdir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .is_some_and(|name| name == "worktrees")
+            && gitdir.join("commondir").is_file()
+            && gitdir.join("gitdir").is_file()
+    }
+
+    /// Returns true if this workspace shares the backing Git repo's refs with
+    /// another workspace, i.e. it is a git linked worktree rather than the
+    /// primary workspace of the Git workdir.
+    ///
+    /// A proper linked worktree's `.git` file points to
+    /// `<git_dir>/worktrees/<name>` and has its own index. When
+    /// `git worktree add` failed (e.g. the git store has no refs to attach a
+    /// worktree to yet), the `.git` file instead points directly at the
+    /// shared git store dir (e.g. `<repo>/.jj/repo/store/git` for clone-style
+    /// repos); that still shares refs, so it's recognized too. The latter is
+    /// only trusted when it resolves to this workspace's own git store dir.
+    ///
+    /// A colocated repo has a `.git` directory instead and is not a linked
+    /// worktree. Likewise, a `.git` gitlink file pointing at an external Git
+    /// repo whose workdir *is* this workspace root belongs to the primary
+    /// workspace, not to a linked worktree.
+    pub fn is_linked_git_worktree(&self) -> bool {
+        if self.is_proper_linked_git_worktree() {
+            return true;
+        }
+        #[cfg(feature = "git")]
+        {
+            let Some(gitdir) = self.linked_git_pointer() else {
+                return false;
+            };
+            let Ok(backend) = crate::git::get_git_backend(self.repo_loader().store().as_ref())
+            else {
+                return false;
+            };
+            // If this workspace root is the Git workdir, the gitlink belongs
+            // to the primary workspace (e.g. --git-dir colocation), which
+            // owns the repo's HEAD and index.
+            if backend.git_repo().workdir().is_some_and(|workdir| {
+                dunce::canonicalize(workdir).ok().as_deref()
+                    == dunce::canonicalize(self.workspace_root()).ok().as_deref()
+            }) {
+                return false;
+            }
+            dunce::canonicalize(backend.git_repo_path()).ok().as_deref()
+                == Some(gitdir.as_path())
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            false
+        }
+    }
+
+    /// Refresh the git index to match the working copy after jj's checkout.
+    ///
+    /// jj writes files that may have different mtime/size than what git
+    /// recorded (e.g. from `git worktree add`), causing `git status` to
+    /// show dirty files even though content is identical. This runs
+    /// `git update-index --refresh` to fix the stat info.
+    ///
+    /// Only runs when the workspace has a proper linked worktree (not a
+    /// raw `gitdir:` pointer to the main repo), so it doesn't accidentally
+    /// modify the main repo's index.
+    #[cfg(feature = "git")]
+    pub fn refresh_git_index(&self) {
+        let Ok(backend) = crate::git::get_git_backend(self.repo_loader().store().as_ref())
+        else {
+            return;
+        };
+        let workspace_root = self.workspace_root();
+        if !workspace_root.join(".git").exists() {
+            return;
+        }
+        // Only refresh if this is a proper linked worktree with its own
+        // index. A raw `gitdir:` fallback pointer has no per-worktree
+        // metadata, so git would resolve to the shared store's main index;
+        // refreshing that from a secondary workspace would corrupt the main
+        // workspace's index.
+        if !self.is_proper_linked_git_worktree() {
+            return;
+        }
+        // Run from the workspace root so git resolves the correct worktree
+        // git dir and index (not the main repo's).
+        match std::process::Command::new(backend.git_executable())
+            .args(["update-index", "-q", "--refresh"])
+            .current_dir(workspace_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status()
+        {
+            Ok(status) if !status.success() => {
+                tracing::debug!(code = ?status.code(), "git update-index --refresh failed");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(error = %err, "git update-index --refresh failed to spawn");
+            }
+        }
     }
 
     /// Settings for this workspace.

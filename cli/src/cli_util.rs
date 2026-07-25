@@ -663,6 +663,8 @@ impl CommandHelper {
                 let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
                 let repo = &workspace_command.user_repo.repo;
                 let desired_wc_commit = workspace_command.prepare_working_copy_mutation().await?;
+                #[cfg(feature = "git")]
+                let linked_git_worktree = workspace_command.workspace.is_linked_git_worktree();
                 let mut locked_ws = workspace_command
                     .workspace
                     .start_working_copy_mutation()
@@ -683,9 +685,12 @@ impl CommandHelper {
                     }
                     WorkingCopyFreshness::WorkingCopyStale
                     | WorkingCopyFreshness::SiblingOperation => {
-                        // Reset Git HEAD first if the repo is colocated
+                        // The primary workspace uses reset_head(). Linked
+                        // worktrees synchronize their private index and HEAD
+                        // after stale-working-copy recovery below.
                         #[cfg(feature = "git")]
                         if workspace_command.env.working_copy_shared_with_git
+                            && !linked_git_worktree
                             && self.should_commit_transaction()
                         {
                             let workspace_name = workspace_command.env.workspace_name();
@@ -727,6 +732,26 @@ impl CommandHelper {
                             short_commit_hash(desired_wc_commit.id())
                         )?;
                     }
+                }
+
+                // A proper linked worktree's Git HEAD is derived from the
+                // working-copy parent. Another workspace can rewrite that
+                // parent without touching this worktree, so synchronize the
+                // stale HEAD before the final snapshot tries to import it as
+                // an external Git checkout.
+                #[cfg(feature = "git")]
+                if self.should_commit_transaction()
+                    && workspace_command
+                        .workspace
+                        .is_proper_linked_git_worktree()
+                    && workspace_command
+                        .linked_worktree_git_head_matches(&stale_wc_commit)?
+                {
+                    workspace_command.sync_linked_git_worktree(
+                        workspace_command.repo().as_ref(),
+                        Some(&stale_wc_commit),
+                        &desired_wc_commit,
+                    )?;
                 }
 
                 // There may be Git refs to import, so snapshot again. Git HEAD
@@ -1335,11 +1360,13 @@ impl WorkspaceCommandHelper {
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git {
+        let stale_linked_git_head = if self.env.working_copy_shared_with_git {
             self.import_git_head(ui, git_import_export_lock)
                 .await
-                .map_err(snapshot_command_error)?;
-        }
+                .map_err(snapshot_command_error)?
+        } else {
+            false
+        };
         // Because the Git refs (except HEAD) aren't imported yet, the ref
         // pointing to the new working-copy commit might not be exported.
         // In that situation, the ref would be conflicted anyway, so export
@@ -1347,6 +1374,30 @@ impl WorkspaceCommandHelper {
         let stats = self
             .snapshot_working_copy(ui, git_import_export_lock)
             .await?;
+
+        // If another workspace rewrote this linked workspace without changing
+        // its checked-out tree, stale checking can be resolved without a file
+        // checkout. Git HEAD still needs to follow the rewritten parent before
+        // the next command mistakes it for an external checkout.
+        #[cfg(feature = "git")]
+        if stale_linked_git_head
+            && self.env.command.should_commit_transaction()
+            && self.workspace.is_proper_linked_git_worktree()
+            && let Some(wc_commit_id) = self.get_wc_commit_id()
+        {
+            let wc_commit = self
+                .repo()
+                .store()
+                .get_commit(wc_commit_id)
+                .map_err(snapshot_command_error)?;
+            if !self
+                .linked_worktree_git_head_matches(&wc_commit)
+                .map_err(snapshot_command_error)?
+            {
+                self.sync_linked_git_worktree(self.repo().as_ref(), None, &wc_commit)
+                    .map_err(snapshot_command_error)?;
+            }
+        }
 
         // import_git_refs() can rebase the working-copy commit.
         #[cfg(feature = "git")]
@@ -1379,21 +1430,29 @@ impl WorkspaceCommandHelper {
     /// If the Git HEAD has changed, this function checks out the new Git HEAD.
     /// The old working-copy commit will be abandoned if it's discardable. The
     /// working-copy state will be reset to point to the new Git HEAD. The
-    /// working-copy contents won't be updated.
+    /// working-copy contents won't be updated. Returns true if a linked
+    /// worktree HEAD was recognized as stale and left for working-copy
+    /// recovery to synchronize.
     #[cfg(feature = "git")]
     #[instrument(skip_all)]
     async fn import_git_head(
         &mut self,
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
-    ) -> Result<(), CommandError> {
+    ) -> Result<bool, CommandError> {
         assert!(self.may_snapshot_working_copy);
+        if self.workspace.is_proper_linked_git_worktree() {
+            // Keep linked-worktree import separate so it can distinguish an
+            // external Git checkout from a stale HEAD left behind when another
+            // jj workspace rewrites this workspace's working-copy parent.
+            return self.import_worktree_git_head(ui).await;
+        }
         let workspace_name = self.workspace_name().to_owned();
         let workspace_root = self.workspace_root().to_owned();
         let mut tx = self.start_transaction();
         jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root).await?;
         if !tx.repo().has_changes() {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut tx = tx.into_inner();
@@ -1445,6 +1504,321 @@ impl WorkspaceCommandHelper {
             }
             self.finish_transaction(ui, tx, "import git head", git_import_export_lock)
                 .await?;
+        }
+        Ok(false)
+    }
+
+    /// Imports HEAD from a proper linked git worktree's own HEAD file.
+    ///
+    /// jj itself keeps the worktree HEAD synced to the working-copy commit's
+    /// parent on every transaction. A mismatch usually means an external Git
+    /// command moved it, but can also mean another jj workspace rewrote this
+    /// workspace. Compare against the working-copy parent and its previous
+    /// operation to distinguish these cases.
+    #[cfg(feature = "git")]
+    async fn import_worktree_git_head(&mut self, ui: &Ui) -> Result<bool, CommandError> {
+        let Some(head_id) = self.read_worktree_head_id()? else {
+            // Unborn HEAD: nothing to check out.
+            return Ok(false);
+        };
+        let workspace_name = self.workspace_name().to_owned();
+        let wc_parent_id = self
+            .repo()
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .map(|id| self.repo().store().get_commit(id))
+            .transpose()?
+            .and_then(|commit| commit.parent_ids().first().cloned());
+        if wc_parent_id.as_ref() == Some(&head_id) {
+            return Ok(false);
+        }
+        if self.worktree_git_head_is_stale(&head_id).await? {
+            // Another jj operation rewrote this workspace's working-copy
+            // commit. The linked worktree still records the parent from the
+            // operation it last checked out, so this mismatch is not evidence
+            // of an external `git checkout`. Let stale-working-copy handling
+            // update the files before synchronizing Git HEAD and the index.
+            return Ok(true);
+        }
+        let Ok(head_commit) = self.repo().store().get_commit_async(&head_id).await else {
+            // The worktree HEAD points to a commit that hasn't been imported
+            // into the jj repo yet. Skip for now; import_git_refs() (and the
+            // next command's retry) will pick it up.
+            tracing::debug!(
+                %head_id,
+                "worktree HEAD not present in the jj store; skipping worktree HEAD import"
+            );
+            return Ok(false);
+        };
+        let mut tx = self.start_transaction().into_inner();
+        let wc_commit = tx
+            .repo_mut()
+            .check_out(workspace_name, &head_commit)
+            .await?;
+        let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+        // The working copy was presumably updated by the git command that updated
+        // HEAD, so we just need to reset our working copy
+        // state to it without updating working copy files.
+        locked_ws.locked_wc().reset(&wc_commit).await?;
+        tx.repo_mut().rebase_descendants().await?;
+        self.user_repo = ReadonlyUserRepo::new(
+            self.env
+                .command
+                .maybe_commit_transaction(tx, "import git head")
+                .await?,
+        );
+        if self.env.command.should_commit_transaction() {
+            locked_ws
+                .finish(self.user_repo.repo.op_id().clone())
+                .await?;
+        }
+        writeln!(
+            ui.status(),
+            "Reset the working copy parent to the new Git HEAD."
+        )?;
+        if !self.env.command.should_commit_transaction() {
+            writeln!(
+                ui.status(),
+                "Operation left uncommitted because --no-integrate-operation was requested: {}",
+                short_operation_hash(self.repo().op_id())
+            )?;
+        }
+        Ok(false)
+    }
+
+    /// Whether the linked worktree's Git HEAD matches the parent recorded by
+    /// the working copy's operation, rather than the current repo operation.
+    #[cfg(feature = "git")]
+    async fn worktree_git_head_is_stale(
+        &self,
+        head_id: &CommitId,
+    ) -> Result<bool, CommandError> {
+        let wc_op_id = self.workspace.working_copy().operation_id();
+        if wc_op_id == self.repo().op_id() {
+            return Ok(false);
+        }
+        let old_operation = match self
+            .workspace
+            .repo_loader()
+            .load_operation(wc_op_id)
+            .await
+        {
+            Ok(operation) => operation,
+            // Without the working-copy operation, we can't establish that
+            // HEAD is merely stale. Preserve the existing import behavior;
+            // missing-operation recovery is handled separately.
+            Err(OpStoreError::ObjectNotFound { .. }) => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        let old_repo = self.workspace.repo_loader().load_at(&old_operation).await?;
+        let Some(old_wc_commit_id) = old_repo
+            .view()
+            .get_wc_commit_id(self.workspace_name())
+        else {
+            return Ok(false);
+        };
+        let old_wc_commit = old_repo
+            .store()
+            .get_commit_async(old_wc_commit_id)
+            .await?;
+        Ok(old_wc_commit.parent_ids().first() == Some(head_id))
+    }
+
+    /// Reads the worktree's own HEAD commit id directly from the worktree's
+    /// HEAD file, without spawning a git subprocess. Returns `None` if HEAD is
+    /// unborn. This is used for linked git worktrees where the git backend's
+    /// `head_id()` returns the main repo's HEAD instead of the worktree's.
+    #[cfg(feature = "git")]
+    fn read_worktree_head_id(&self) -> Result<Option<CommitId>, CommandError> {
+        let workspace_root = self.workspace.workspace_root();
+        // .git is a file for linked worktrees: "gitdir: /path/to/worktrees/<name>"
+        let dot_git = workspace_root.join(".git");
+        let gitdir_content = std::fs::read_to_string(&dot_git)
+            .map_err(|err| {
+                internal_error_with_message(
+                    "Failed to read .git file for linked worktree",
+                    err,
+                )
+            })?;
+        let gitdir_str = gitdir_content
+            .trim()
+            .strip_prefix("gitdir:")
+            .unwrap_or("")
+            .trim();
+        let worktree_gitdir = if std::path::Path::new(gitdir_str).is_absolute() {
+            std::path::PathBuf::from(gitdir_str)
+        } else {
+            dunce::canonicalize(workspace_root.join(gitdir_str))
+                .map_err(|err| internal_error_with_message("Failed to canonicalize worktree gitdir", err))?
+        };
+        let head_path = worktree_gitdir.join("HEAD");
+        let Ok(head_content) = std::fs::read_to_string(&head_path) else {
+            return Ok(None); // HEAD file missing → unborn
+        };
+        let head_content = head_content.trim();
+        if head_content.starts_with("ref:") {
+            // Symbolic ref (attached HEAD): resolve via gix
+            let ref_name = head_content.strip_prefix("ref:").unwrap().trim();
+            let git_backend = jj_lib::git::get_git_backend(self.repo().store())
+                .map_err(|e| internal_error(format!("Not a git backend: {e}")))?;
+            let git_repo = git_backend.git_repo();
+            if let Ok(reference) = git_repo.find_reference(ref_name)
+                && let Ok(id) = reference.into_fully_peeled_id()
+            {
+                return Ok(Some(CommitId::from_bytes(id.as_bytes())));
+            }
+            Ok(None) // Unborn branch
+        } else {
+            // Detached HEAD: raw commit hash
+            Ok(Some(CommitId::try_from_hex(head_content).ok_or_else(|| {
+                internal_error(format!("Invalid hex commit id in worktree HEAD: {head_content}"))
+            })?))
+        }
+    }
+
+    #[cfg(feature = "git")]
+    fn linked_worktree_git_head_matches(
+        &self,
+        wc_commit: &Commit,
+    ) -> Result<bool, CommandError> {
+        let expected_head = wc_commit
+            .parent_ids()
+            .first()
+            .filter(|id| *id != self.repo().store().root_commit_id());
+        Ok(self.read_worktree_head_id()?.as_ref() == expected_head)
+    }
+
+    /// Synchronizes a proper linked Git worktree's private index and HEAD to
+    /// the parent of `wc_commit`.
+    #[cfg(feature = "git")]
+    fn sync_linked_git_worktree(
+        &self,
+        repo: &dyn Repo,
+        maybe_old_wc_commit: Option<&Commit>,
+        wc_commit: &Commit,
+    ) -> Result<(), CommandError> {
+        debug_assert!(self.workspace.is_proper_linked_git_worktree());
+        let Ok(backend) = jj_lib::git::get_git_backend(repo.store()) else {
+            return Ok(());
+        };
+        tracing::debug!(
+            workspace_root = %self.workspace.workspace_root().display(),
+            "linked worktree detected, syncing HEAD and index"
+        );
+        let workspace_root = self.workspace.workspace_root();
+        let git_executable = backend.git_executable();
+        let parent_commit_id = wc_commit.parent_ids().first();
+        let (parent_tree_hex, parent_tree_ids) = if let Some(parent_id) = parent_commit_id {
+            if parent_id == repo.store().root_commit_id() {
+                // Parent is root → empty tree
+                (None, None)
+            } else {
+                let parent_commit = repo.store().get_commit(parent_id).map_err(|err| {
+                    internal_error_with_message(
+                        format!("failed to read parent commit: {err}"),
+                        err,
+                    )
+                })?;
+                let tree_ids = parent_commit.tree_ids().clone();
+                (
+                    tree_ids.as_resolved().map(|tree_id| tree_id.hex()),
+                    Some(tree_ids),
+                )
+            }
+        } else {
+            (None, None)
+        };
+        let old_parent_tree_ids = match maybe_old_wc_commit {
+            Some(old_wc_commit) => match old_wc_commit.parent_ids().first() {
+                Some(parent_id) if parent_id != repo.store().root_commit_id() => {
+                    Some(repo.store().get_commit(parent_id)?.tree_ids().clone())
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        let index_tree_changed = old_parent_tree_ids != parent_tree_ids;
+
+        // Update the worktree's index to match the parent tree, so
+        // `git status` shows the same diffs as `jj diff`. Do this before moving
+        // HEAD: if the index is locked or otherwise unwritable, leaving HEAD
+        // untouched avoids a half-synced Git worktree.
+        let read_tree_result = if !index_tree_changed {
+            None
+        } else if let Some(tree_hex) = &parent_tree_hex {
+            Some(
+                std::process::Command::new(git_executable)
+                    .args(["read-tree", tree_hex])
+                    .current_dir(workspace_root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output(),
+            )
+        } else {
+            // Parent is root → empty tree
+            Some(
+                std::process::Command::new(git_executable)
+                    .args(["read-tree", "--empty"])
+                    .current_dir(workspace_root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output(),
+            )
+        };
+        let output = read_tree_result.transpose().map_err(|err| {
+            internal_error_with_message(
+                "failed to start git read-tree for linked worktree index sync",
+                err,
+            )
+        })?;
+        if let Some(output) = output
+            && !output.status.success()
+        {
+            return Err(user_error(format!(
+                "Failed to update the linked Git worktree index: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        // Update the worktree's HEAD only after its index is ready.
+        if let Some(parent_id) = parent_commit_id {
+            if parent_id == repo.store().root_commit_id() {
+                // Set HEAD as unborn (symbolic ref to a non-existent branch).
+                if let Err(err) = std::process::Command::new(git_executable)
+                    .args(["update-ref", "-d", "refs/jj/root"])
+                    .current_dir(workspace_root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    tracing::debug!(error = %err, "failed to delete refs/jj/root");
+                }
+                if let Err(err) = std::process::Command::new(git_executable)
+                    .args(["symbolic-ref", "HEAD", "refs/jj/root"])
+                    .current_dir(workspace_root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    tracing::debug!(error = %err, "failed to set symbolic-ref HEAD");
+                }
+            } else {
+                // --no-deref ensures an attached branch isn't force-moved.
+                if let Err(err) = std::process::Command::new(git_executable)
+                    .args(["update-ref", "--no-deref", "HEAD", &parent_id.hex()])
+                    .current_dir(workspace_root)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    tracing::debug!(error = %err, "failed to update-ref HEAD");
+                }
+            }
         }
         Ok(())
     }
@@ -2099,6 +2473,9 @@ to the current parents may contain changes from multiple commits.
             .snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)
             .map_err(snapshot_command_error)?;
 
+        #[cfg(feature = "git")]
+        let linked_git_worktree = self.workspace.is_linked_git_worktree();
+
         // Compare working-copy tree and operation with repo's, and reload as needed.
         let mut locked_ws = self
             .workspace
@@ -2181,8 +2558,14 @@ to the current parents may contain changes from multiple commits.
                 .map_err(snapshot_command_error)?;
             }
 
+            // Only the workspace colocated with the Git workdir syncs the main
+            // repo's HEAD and index. Linked worktrees (including fallback
+            // `gitdir:` pointers, which share the main repo's HEAD and index)
+            // must not drive them from their own snapshots.
             #[cfg(feature = "git")]
-            if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction()
+            if self.env.working_copy_shared_with_git
+                && !linked_git_worktree
+                && self.env.command.should_commit_transaction()
             {
                 let workspace_root = self.env.workspace_root();
                 if wc_immutable {
@@ -2288,6 +2671,60 @@ to the current parents may contain changes from multiple commits.
             new_commit,
         )
         .await?;
+
+        // In non-colocated workspaces, filter drivers (e.g. LFS) may write
+        // content with a different size than what the Git index recorded
+        // (pointer vs real content). Run `git add -u` for only the paths
+        // touched by checkout to re-apply the clean filter and refresh the
+        // stat cache so `git status` doesn't show spurious modifications.
+        //
+        // Only run in proper linked worktrees, which have their own index.
+        // In colocated repos, `git add -u` would re-stage intent-to-add files
+        // and update index entries that tests expect to have zero stat info.
+        // A fallback `gitdir:` pointer shares the main repo's index, so
+        // refreshing it here would clobber the main workspace's index.
+        // Passing an explicit pathspec is important: an unrestricted
+        // `git add -u` scans every tracked path and can run clean filters such
+        // as LFS across the whole repository, making a small checkout take
+        // minutes. Feed paths over stdin to avoid command-line length limits.
+        #[cfg(feature = "git")]
+        if !stats.changed_paths.is_empty()
+            && self.working_copy_shared_with_git()
+            && self.workspace.is_proper_linked_git_worktree()
+        {
+            use std::io::Write as _;
+
+            let workspace_root = self.workspace.workspace_root();
+            let git_executable = jj_lib::git::get_git_backend(self.repo().store())
+                .map(|b| b.git_executable().to_path_buf())
+                .unwrap_or_else(|_| std::path::PathBuf::from("git"));
+            let child = std::process::Command::new(&git_executable)
+                .args(["add", "-u", "--pathspec-from-file=-", "--pathspec-file-nul"])
+                .current_dir(workspace_root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let status = child.and_then(|mut child| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    for path in &stats.changed_paths {
+                        stdin.write_all(path.as_internal_file_string().as_bytes())?;
+                        stdin.write_all(&[0])?;
+                    }
+                }
+                child.wait()
+            });
+            match status {
+                Ok(status) if !status.success() => {
+                    tracing::debug!(code = ?status.code(), "git add -u failed after checkout");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!(error = %err, "git add -u failed after checkout");
+                }
+            }
+        }
+
         self.print_updated_working_copy_stats(ui, maybe_old_commit, new_commit, &stats)
     }
 
@@ -2390,8 +2827,31 @@ to the current parents may contain changes from multiple commits.
         };
 
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
-            if let Some(wc_commit) = &maybe_new_wc_commit {
+        let linked_git_worktree = self.workspace.is_linked_git_worktree();
+        #[cfg(feature = "git")]
+        let proper_linked_git_worktree = self.workspace.is_proper_linked_git_worktree();
+        #[cfg(feature = "git")]
+        let shares_git_refs =
+            self.env.working_copy_shared_with_git || linked_git_worktree;
+        #[cfg(feature = "git")]
+        let git_refs_changed = old_repo.view().local_bookmarks().ne(
+            tx.repo().view().local_bookmarks(),
+        ) || old_repo
+            .view()
+            .all_remote_bookmarks()
+            .ne(tx.repo().view().all_remote_bookmarks())
+            || old_repo.view().local_tags().ne(tx.repo().view().local_tags())
+            || old_repo.view().git_refs() != tx.repo().view().git_refs();
+        #[cfg(feature = "git")]
+        if shares_git_refs && self.env.command.should_commit_transaction() {
+            // Only the workspace colocated with the Git workdir owns the main
+            // Git HEAD. Linked worktrees don't: proper ones have their own
+            // HEAD (synced separately below), and fallback `gitdir:` pointers
+            // share the main repo's HEAD, which the main workspace owns.
+            if self.env.working_copy_shared_with_git
+                && !linked_git_worktree
+                && let Some(wc_commit) = &maybe_new_wc_commit
+            {
                 try_reset_git_head(
                     ui,
                     tx.repo_mut(),
@@ -2402,8 +2862,31 @@ to the current parents may contain changes from multiple commits.
                 )
                 .await?;
             }
-            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
-            crate::git_util::print_git_export_stats(ui, &stats)?;
+            // Linked worktrees share the common git refs (refs/heads/*) with
+            // the main worktree, so bookmark changes must be exported from
+            // secondary workspaces too. Otherwise refs/heads and the @git
+            // tracking bookmarks are left behind (e.g. after `jj git push`).
+            if git_refs_changed {
+                let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+                crate::git_util::print_git_export_stats(ui, &stats)?;
+            }
+        }
+
+        // Proper linked worktrees have their own HEAD and index that need to
+        // be synced separately so that `git status` works correctly after
+        // jj edit/new. A fallback `gitdir:` pointer has no per-worktree HEAD
+        // or index; it shares the main repo's, which the main workspace owns,
+        // so it must not be synced from here.
+        #[cfg(feature = "git")]
+        if self.env.command.should_commit_transaction()
+            && proper_linked_git_worktree
+            && let Some(wc_commit) = &maybe_new_wc_commit
+        {
+            self.sync_linked_git_worktree(
+                tx.repo(),
+                maybe_old_wc_commit.as_ref(),
+                wc_commit,
+            )?;
         }
 
         self.user_repo = ReadonlyUserRepo::new(

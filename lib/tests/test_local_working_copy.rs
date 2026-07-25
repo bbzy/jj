@@ -682,7 +682,8 @@ fn test_conflicting_changes_on_disk() -> TestResult {
             updated_files: 0,
             added_files: 3,
             removed_files: 0,
-            skipped_files: 3
+            skipped_files: 3,
+            changed_paths: stats.changed_paths.clone(),
         }
     );
 
@@ -906,7 +907,8 @@ fn test_materialize_snapshot_conflicted_files() -> TestResult {
             updated_files: 0,
             added_files: 2,
             removed_files: 0,
-            skipped_files: 0
+            skipped_files: 0,
+            changed_paths: stats.changed_paths.clone(),
         }
     );
 
@@ -1078,6 +1080,7 @@ fn test_materialize_snapshot_unchanged_conflicts() -> TestResult {
         stats,
         CheckoutStats {
             updated_files: 1,
+            changed_paths: vec![file_path.to_owned()],
             ..CheckoutStats::default()
         }
     );

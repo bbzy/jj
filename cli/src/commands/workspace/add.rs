@@ -30,6 +30,8 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
+#[cfg(feature = "git")]
+use crate::commands::git::maybe_add_gitignore;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
 use crate::ui::Ui;
@@ -151,6 +153,8 @@ pub async fn cmd_workspace_add(
     }
 
     let mut new_workspace_command = command.for_workable_repo(ui, new_workspace, repo)?;
+    #[cfg(feature = "git")]
+    maybe_add_gitignore(&new_workspace_command)?;
 
     let sparsity = match args.sparse_patterns {
         SparseInheritance::Full => None,
@@ -232,5 +236,12 @@ pub async fn cmd_workspace_add(
         ),
     )
     .await?;
+
+    // Refresh the git index after jj's checkout. jj writes files that may
+    // have different mtime/size than what git recorded, causing `git
+    // status` to show dirty files even though content is identical.
+    #[cfg(feature = "git")]
+    new_workspace_command.workspace().refresh_git_index();
+
     Ok(())
 }
