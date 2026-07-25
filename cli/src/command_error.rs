@@ -390,7 +390,12 @@ impl From<OpsetEvaluationError> for CommandError {
 
 impl From<SnapshotError> for CommandError {
     fn from(err: SnapshotError) -> Self {
-        internal_error_with_message("Failed to snapshot the working copy", err)
+        match &err {
+            SnapshotError::FilterCleanFailed { .. } => {
+                user_error_with_message("Failed to snapshot the working copy", err)
+            }
+            _ => internal_error_with_message("Failed to snapshot the working copy", err),
+        }
     }
 }
 

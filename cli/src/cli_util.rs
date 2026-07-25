@@ -3422,10 +3422,8 @@ pub async fn update_working_copy(
         .check_out(repo.op_id().clone(), old_tree.as_ref(), new_commit)
         .await
         .map_err(|err| {
-            internal_error_with_message(
-                format!("Failed to check out commit {}", new_commit.id().hex()),
-                err,
-            )
+            let msg = format!("Failed to check out commit {}", new_commit.id().hex());
+            internal_error_with_message(msg, err)
         })?;
     Ok(stats)
 }

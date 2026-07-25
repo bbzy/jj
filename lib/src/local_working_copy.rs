@@ -62,6 +62,7 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::backend::BackendError;
+
 use crate::backend::CopyId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
@@ -88,11 +89,16 @@ use crate::file_util::check_symlink_support;
 use crate::file_util::copy_async_to_sync;
 use crate::file_util::persist_temp_file;
 use crate::file_util::symlink_file;
+use crate::filter::FilterDriverCache;
 use crate::fsmonitor::FsmonitorSettings;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::WatchmanConfig;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
+use crate::gitattributes::DiskFileLoader;
+use crate::gitattributes::GitAttributes;
+use crate::gitattributes::SearchPriority;
+use crate::gitattributes::TreeFileLoader;
 use crate::gitignore::GitIgnoreFile;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
@@ -1009,6 +1015,7 @@ pub struct TreeState {
     exec_policy: ExecChangePolicy,
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
+    filter_driver_cache: Arc<FilterDriverCache>,
 }
 
 #[derive(Debug, Error)]
@@ -1085,6 +1092,7 @@ impl TreeState {
         }: &TreeStateSettings,
     ) -> Self {
         let exec_policy = ExecChangePolicy::new(*exec_change_setting, &state_path);
+        let working_copy_path_for_filters = working_copy_path.clone();
         Self {
             store: store.clone(),
             working_copy_path,
@@ -1099,6 +1107,10 @@ impl TreeState {
             exec_policy,
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
+            filter_driver_cache: Arc::new(FilterDriverCache::with_workspace_root(
+                store.clone(),
+                working_copy_path_for_filters,
+            )),
         }
     }
 
@@ -1334,6 +1346,10 @@ impl TreeState {
         let (deleted_files_tx, deleted_files_rx) = channel();
 
         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
+            let snapshot_git_attributes = Arc::new(GitAttributes::new(
+                TreeFileLoader::new(self.tree.clone()),
+                DiskFileLoader::new(self.working_copy_path.clone()),
+            ));
             let snapshotter = FileSnapshotter {
                 tree_state: self,
                 current_tree: &self.tree,
@@ -1349,6 +1365,8 @@ impl TreeState {
                 error: OnceLock::new(),
                 progress: *progress,
                 max_new_file_size: *max_new_file_size,
+                git_attributes: snapshot_git_attributes,
+                filter_driver_cache: self.filter_driver_cache.clone(),
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1524,6 +1542,9 @@ struct FileSnapshotter<'a> {
     error: OnceLock<SnapshotError>,
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
+
+    git_attributes: Arc<GitAttributes>,
+    filter_driver_cache: Arc<FilterDriverCache>,
 }
 
 impl FileSnapshotter<'_> {
@@ -1694,13 +1715,39 @@ impl FileSnapshotter<'_> {
                     && (metadata.len() > self.max_new_file_size
                         && !self.force_tracking_matcher.matches(&path))
                 {
-                    // Leave the large file untracked
-                    let reason = UntrackedReason::FileTooLarge {
-                        size: metadata.len(),
-                        max_size: self.max_new_file_size,
-                    };
-                    self.untracked_paths_tx.send((path, reason)).ok();
-                    Ok(None)
+                    // Check if a clean filter would shrink this file
+                    // (e.g. Git LFS would convert large files to small
+                    // pointers). If so, the cleaned size is what matters.
+                    let cleaned_len = self
+                        .get_cleaned_len_for_size_check(&path, &entry.path(), metadata.len())
+                        .await;
+                    if cleaned_len > self.max_new_file_size {
+                        let reason = UntrackedReason::FileTooLarge {
+                            size: metadata.len(),
+                            max_size: self.max_new_file_size,
+                        };
+                        self.untracked_paths_tx.send((path, reason)).ok();
+                        Ok(None)
+                    } else {
+                        // The file will be tracked and its content converted
+                        // by the clean filter during write_file_to_store().
+                        if let Some(new_file_state) = file_state(&metadata)
+                            .map_err(|err| {
+                                snapshot_error_for_mtime_out_of_range(err, &entry.path())
+                            })?
+                        {
+                            self.process_present_file(
+                                path,
+                                &entry.path(),
+                                maybe_current_file_state.as_ref(),
+                                new_file_state,
+                            )
+                            .await?;
+                            Ok(Some((PresentDirEntryKind::File, name_string)))
+                        } else {
+                            Ok(None)
+                        }
+                    }
                 } else if let Some(new_file_state) = file_state(&metadata)
                     .map_err(|err| snapshot_error_for_mtime_out_of_range(err, &entry.path()))?
                 {
@@ -1719,6 +1766,48 @@ impl FileSnapshotter<'_> {
             }
         } else {
             Ok(None)
+        }
+    }
+
+    /// Returns the estimated size of a file after applying its clean filter.
+    ///
+    /// This is used during the size check for new files: if a file is too
+    /// large on disk but would be small after cleaning (e.g. LFS pointers),
+    /// we allow it through. Returns the original length if there is no
+    /// applicable clean filter.
+    async fn get_cleaned_len_for_size_check(
+        &self,
+        path: &RepoPath,
+        disk_path: &Path,
+        original_len: u64,
+    ) -> u64 {
+        let filter_name = self
+            .git_attributes
+            .filter_name(path, SearchPriority::Disk)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    path = ?path,
+                    error = %err,
+                    "failed to read gitattributes for clean filter during size check; skipping filter"
+                );
+                None
+            });
+        let Some(filter_name) = filter_name else {
+            return original_len;
+        };
+        let Some(driver) = self.filter_driver_cache.get(&filter_name) else {
+            return original_len;
+        };
+        if !driver.has_clean() {
+            return original_len;
+        }
+        let Ok(file_content) = std::fs::read(disk_path) else {
+            return original_len;
+        };
+        match driver.clean(&file_content, disk_path, path.as_internal_file_string()) {
+            Ok(cleaned) => cleaned.len() as u64,
+            Err(_) => original_len,
         }
     }
 
@@ -1812,8 +1901,6 @@ impl FileSnapshotter<'_> {
                 PresentDirEntryKind::File => !present_entries.files.contains(name),
             })
             .flat_map(|(_, chunk)| chunk)
-            // Whether or not the entry exists, submodule should be ignored
-            .filter(|(_, state)| state.file_type != FileType::GitSubmodule)
             .filter(|(path, _)| self.matcher.matches(path))
             .try_for_each(|(path, _)| self.deleted_files_tx.send(path.to_owned()))
             .ok();
@@ -1965,6 +2052,70 @@ impl FileSnapshotter<'_> {
             .await?;
             match new_file_ids.into_resolved() {
                 Ok(file_id) => {
+                    // The conflict was resolved. If a clean filter applies to
+                    // this path, the resolved content was read without the
+                    // clean filter (only EOL conversion was applied above).
+                    // We need to re-apply the clean filter to the resolved
+                    // content to ensure the stored content is consistent.
+                    let file_id = if let Some(resolved_id) = file_id {
+                        let filter_name = self
+                            .git_attributes
+                            .filter_name(repo_path, SearchPriority::Disk)
+                            .block_on()
+                            .unwrap_or_else(|err| {
+                                tracing::warn!(
+                                    path = ?repo_path,
+                                    error = %err,
+                                    "failed to read gitattributes for clean filter; skipping filter"
+                                );
+                                None
+                            });
+                        let driver = filter_name
+                            .as_ref()
+                            .and_then(|name| self.filter_driver_cache.get(name));
+                        if let Some(driver) = driver
+                            && driver.has_clean()
+                        {
+                            // Re-read the resolved content from the store,
+                            // apply the clean filter, and write it back.
+                            let stored_content = self
+                                .store()
+                                .read_file(repo_path, &resolved_id)
+                                .await
+                                .map_err(|err| SnapshotError::Other {
+                                    message: format!(
+                                        "Failed to read resolved file {}",
+                                        disk_path.display()
+                                    ),
+                                    err: err.into(),
+                                })?;
+                            let mut stored = Vec::new();
+                            let mut reader = stored_content;
+                            reader.read_to_end(&mut stored).await.map_err(|err| {
+                                SnapshotError::Other {
+                                    message: format!(
+                                        "Failed to read resolved file content {}",
+                                        disk_path.display()
+                                    ),
+                                    err: err.into(),
+                                }
+                            })?;
+                            let cleaned = driver.clean(&stored, disk_path, repo_path.as_internal_file_string()).map_err(|err| {
+                                SnapshotError::FilterCleanFailed {
+                                    filter_name: filter_name.as_ref().unwrap().clone(),
+                                    path: disk_path.display().to_string(),
+                                    err: err.into(),
+                                }
+                            })?;
+                            self.store()
+                                .write_file(repo_path, &mut cleaned.as_slice())
+                                .await?
+                        } else {
+                            resolved_id
+                        }
+                    } else {
+                        file_id.unwrap()
+                    };
                     // On Windows, we preserve the executable bit from the merged trees.
                     let executable = exec_bit.for_tree_value(self.tree_state.exec_policy, || {
                         current_tree_values
@@ -1973,7 +2124,7 @@ impl FileSnapshotter<'_> {
                             .and_then(conflicts::resolve_file_executable)
                     });
                     Ok(Merge::normal(TreeValue::File {
-                        id: file_id.unwrap(),
+                        id: file_id,
                         executable,
                         copy_id,
                     }))
@@ -1996,6 +2147,51 @@ impl FileSnapshotter<'_> {
         path: &RepoPath,
         disk_path: &Path,
     ) -> Result<FileId, SnapshotError> {
+        // Check if a clean filter applies to this path.
+        let filter_name = self
+            .git_attributes
+            .filter_name(path, SearchPriority::Disk)
+            .block_on()
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    path = ?path,
+                    error = %err,
+                    "failed to read gitattributes for clean filter; skipping filter"
+                );
+                None
+            });
+        let driver = filter_name
+            .as_ref()
+            .and_then(|name| self.filter_driver_cache.get(name));
+        if let Some(driver) = driver
+            && driver.has_clean()
+        {
+            let file_content = std::fs::read(disk_path).map_err(|err| SnapshotError::Other {
+                message: format!("Failed to read file {}", disk_path.display()),
+                err: err.into(),
+            })?;
+            let cleaned =
+                driver
+                    .clean(&file_content, disk_path, path.as_internal_file_string())
+                    .map_err(|err| SnapshotError::FilterCleanFailed {
+                        filter_name: filter_name.as_ref().unwrap().clone(),
+                        path: disk_path.display().to_string(),
+                        err: err.into(),
+                    })?;
+            // Apply EOL normalization to the cleaned content, matching Git's
+            // conversion order: working tree → clean filter → EOL → store.
+            let mut contents = self
+                .tree_state
+                .target_eol_strategy
+                .convert_eol_for_snapshot(futures::io::Cursor::new(cleaned))
+                .await
+                .map_err(|err| SnapshotError::Other {
+                    message: "Failed to convert the EOL after clean filter".to_string(),
+                    err: err.into(),
+                })?;
+            return Ok(self.store().write_file(path, &mut contents).await?);
+        }
+
         let file = File::open(disk_path).map_err(|err| SnapshotError::Other {
             message: format!("Failed to open file {}", disk_path.display()),
             err: err.into(),
@@ -2227,6 +2423,10 @@ impl TreeState {
         let mut changed_file_states = Vec::new();
         let mut deleted_files = HashSet::new();
         let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
+        let checkout_git_attributes = GitAttributes::new(
+            TreeFileLoader::new(new_tree.clone()),
+            DiskFileLoader::new(self.working_copy_path.clone()),
+        );
 
         let mut process_diff_entry = async |path: RepoPathBuf,
                                             before: MergedTreeValue,
@@ -2251,8 +2451,6 @@ impl TreeState {
                 && matches!(after, MaterializedTreeValue::GitSubmodule(_))
             {
                 eprintln!("ignoring git submodule at {path:?}");
-                // Not updating the file state as if there were no diffs. Leave
-                // the state type as FileType::GitSubmodule if it was before.
                 return Ok(());
             }
 
@@ -2360,11 +2558,77 @@ impl TreeState {
                     deleted_files.insert(path);
                     return Ok(());
                 }
-                MaterializedTreeValue::File(file) => {
+                MaterializedTreeValue::File(mut file) => {
                     let exec_bit =
                         ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
-                    self.write_file(&disk_path, file.reader, exec_bit, true)
-                        .await?
+
+                    // Check if smudge filter applies to this path.
+                    let filter_name = checkout_git_attributes
+                        .filter_name(&path, SearchPriority::Store)
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                path = ?path,
+                                error = %err,
+                                "failed to read gitattributes for smudge filter; skipping filter"
+                            );
+                            None
+                        });
+                    let smudge_driver = filter_name
+                        .as_ref()
+                        .and_then(|name| self.filter_driver_cache.get(name))
+                        .filter(|d| d.has_smudge());
+
+                    if let Some(ref driver) = smudge_driver {
+                        let mut pointer = Vec::new();
+                        file.reader.read_to_end(&mut pointer).await.map_err(|err| {
+                            CheckoutError::Other {
+                                message: format!(
+                                    "Failed to read filter pointer for {}",
+                                    disk_path.display()
+                                ),
+                                err: err.into(),
+                            }
+                        })?;
+                        match driver.smudge(&pointer, &disk_path, path.as_internal_file_string()) {
+                            Ok(smudged) => {
+                                self.write_file(&disk_path, smudged.as_slice(), exec_bit, true)
+                                    .await?
+                            }
+                            Err(err) => {
+                                if driver.required {
+                                    return Err(CheckoutError::Other {
+                                        message: format!(
+                                            "Smudge filter failed for {}: {err}",
+                                            disk_path.display()
+                                        ),
+                                        err: err.into(),
+                                    });
+                                }
+                                // Non-required filter (e.g. LFS object not
+                                // in local cache). Fall back to writing the
+                                // raw stored content (pointer) so checkout
+                                // doesn't block. The user can fetch the
+                                // object and re-checkout later.
+                                tracing::warn!(
+                                    path = %disk_path.display(),
+                                    filter = %filter_name.as_deref().unwrap_or("?"),
+                                    error = %err,
+                                    "smudge filter failed; writing raw pointer content",
+                                );
+                                self.write_file(
+                                    &disk_path,
+                                    pointer.as_slice(),
+                                    exec_bit,
+                                    true,
+                                )
+                                .await?
+                            }
+                        }
+                    } else {
+                        self.write_file(&disk_path, file.reader, exec_bit, true)
+                            .await?
+                    }
                 }
                 MaterializedTreeValue::Symlink { id: _, target } => {
                     if self.symlink_support {

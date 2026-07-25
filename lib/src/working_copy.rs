@@ -189,6 +189,18 @@ pub enum SnapshotError {
     /// Failed to load the working copy state.
     #[error(transparent)]
     WorkingCopyStateError(#[from] WorkingCopyStateError),
+    /// A Git filter driver (e.g. LFS clean/smudge) failed. This is a
+    /// user-configuration issue, not an internal error.
+    #[error("Filter driver `{filter_name}` clean failed for {path}")]
+    FilterCleanFailed {
+        /// The name of the filter driver (e.g. `"lfs"`).
+        filter_name: String,
+        /// The path of the file that failed to filter.
+        path: String,
+        /// The underlying filter error.
+        #[source]
+        err: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Some other error happened while snapshotting the working copy.
     #[error("{message}")]
     Other {

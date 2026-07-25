@@ -46,6 +46,7 @@ pub use jj_core::file_util;
 pub mod files;
 pub mod fileset;
 mod fileset_parser;
+pub(crate) mod filter;
 pub mod fix;
 pub mod fmt_util;
 pub mod fsmonitor;

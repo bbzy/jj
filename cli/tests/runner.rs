@@ -47,6 +47,7 @@ mod test_git_clone;
 mod test_git_colocated;
 mod test_git_colocation;
 mod test_git_fetch;
+mod test_git_filters;
 mod test_git_import_export;
 mod test_git_init;
 mod test_git_private_commits;

@@ -16,6 +16,7 @@ mod test_converge;
 mod test_default_revset_graph_iterator;
 mod test_eol;
 mod test_evolution_predecessors;
+mod test_filter;
 mod test_fix;
 mod test_git;
 mod test_git_backend;
