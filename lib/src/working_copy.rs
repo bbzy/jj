@@ -236,6 +236,11 @@ pub struct SnapshotOptions<'a> {
     /// (depending on implementation)
     /// return `SnapshotError::NewFileTooLarge`.
     pub max_new_file_size: u64,
+    /// Tree whose path casing is authoritative for case-insensitive snapshot
+    /// matching (typically the working-copy commit's parent tree, mirroring
+    /// Git's index/HEAD casing). When `None`, only the file states recorded by
+    /// the last snapshot are consulted.
+    pub case_reference_tree: Option<&'a MergedTree>,
 }
 
 /// A callback for getting progress updates.

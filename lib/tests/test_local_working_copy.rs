@@ -2149,6 +2149,170 @@ fn test_check_out_existing_directory_symlink() -> TestResult {
 }
 
 #[test]
+fn test_snapshot_case_only_rename_icase_fs() -> TestResult {
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        eprintln!("Skipping test because case-insensitive matching is only enabled on macOS/Windows");
+        return Ok(());
+    }
+
+    let mut test_workspace = TestWorkspace::init();
+    let repo = test_workspace.repo.clone();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    if !check_icase_fs(&workspace_root) {
+        eprintln!("Skipping test because filesystem is case-sensitive");
+        return Ok(());
+    }
+
+    // Track a file in a subdirectory, then rename both only in case. The
+    // snapshot should keep the tracked casing instead of recording a
+    // delete+add (aligned with Git's core.ignorecase behavior).
+    std::fs::create_dir(workspace_root.join("SubDir"))?;
+    std::fs::write(workspace_root.join("SubDir/Inner.TXT"), "inner\n")?;
+    std::fs::write(workspace_root.join("CaseFile.txt"), "contents\n")?;
+    let tree1 = test_workspace.snapshot()?;
+    let expected_tree1 = create_tree(
+        &repo,
+        &[
+            (repo_path("CaseFile.txt"), "contents\n"),
+            (repo_path("SubDir/Inner.TXT"), "inner\n"),
+        ],
+    );
+    assert_tree_eq!(tree1, expected_tree1);
+
+    std::fs::rename(
+        workspace_root.join("CaseFile.txt"),
+        workspace_root.join("casefile.txt"),
+    )?;
+    std::fs::rename(workspace_root.join("SubDir"), workspace_root.join("subdir"))?;
+    let tree2 = test_workspace.snapshot()?;
+    assert_tree_eq!(tree2, expected_tree1);
+
+    // Content modifications through the differently-cased name are still
+    // detected, and recorded under the tracked casing.
+    std::fs::write(workspace_root.join("casefile.txt"), "contents\nmore\n")?;
+    let tree3 = test_workspace.snapshot()?;
+    let expected_tree3 = create_tree(
+        &repo,
+        &[
+            (repo_path("CaseFile.txt"), "contents\nmore\n"),
+            (repo_path("SubDir/Inner.TXT"), "inner\n"),
+        ],
+    );
+    assert_tree_eq!(tree3, expected_tree3);
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_case_conflicting_directories_icase_fs() -> TestResult {
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        eprintln!("Skipping test because case-insensitive matching is only enabled on macOS/Windows");
+        return Ok(());
+    }
+
+    let mut test_workspace = TestWorkspace::init();
+    let repo = test_workspace.repo.clone();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    if !check_icase_fs(&workspace_root) {
+        eprintln!("Skipping test because filesystem is case-sensitive");
+        return Ok(());
+    }
+
+    // Git trees can contain both directory casings even though the working
+    // copy filesystem presents them as one directory. The complete paths are
+    // nevertheless unambiguous and snapshotting must preserve their tracked
+    // casing instead of adding duplicates under the on-disk casing.
+    let expected_tree = create_tree(
+        &repo,
+        &[
+            (repo_path("Subagent/manager"), "manager\n"),
+            (repo_path("subagent/view"), "view\n"),
+        ],
+    );
+    let commit = commit_with_tree(repo.store(), expected_tree.clone());
+    test_workspace
+        .workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .block_on()?;
+
+    assert!(workspace_root.join("Subagent/manager").is_file());
+    assert!(workspace_root.join("Subagent/view").is_file());
+    let options = SnapshotOptions {
+        case_reference_tree: Some(&expected_tree),
+        ..empty_snapshot_options()
+    };
+    let (actual_tree, _) = test_workspace.snapshot_with_options(&options)?;
+    assert_tree_eq!(actual_tree, expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_fsmonitor_canonicalizes_case_icase_fs() -> TestResult {
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        eprintln!("Skipping test because case-insensitive matching is only enabled on macOS/Windows");
+        return Ok(());
+    }
+
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    if !check_icase_fs(&workspace_root) {
+        eprintln!("Skipping test because filesystem is case-sensitive");
+        return Ok(());
+    }
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    // Track a file, then rename it only in case and modify its content. The
+    // fsmonitor reports the on-disk (lowercase) name; the matcher must be
+    // canonicalized to the tracked casing or the modification is missed.
+    testutils::write_working_copy_file(&workspace_root, repo_path("CaseFile.txt"), "old\n");
+    let snapshot = |changed_files: Option<Vec<PathBuf>>| {
+        let fsmonitor_settings = match changed_files {
+            Some(changed_files) => FsmonitorSettings::Test { changed_files },
+            None => FsmonitorSettings::None,
+        };
+        let settings = TreeStateSettings {
+            fsmonitor_settings,
+            ..tree_state_settings.clone()
+        };
+        let mut tree_state = TreeState::load(
+            repo.store().clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            &settings,
+        )
+        .unwrap();
+        tree_state
+            .snapshot(&empty_snapshot_options())
+            .block_on()
+            .unwrap();
+        tree_state.save().unwrap();
+        tree_state
+    };
+
+    // Full scan to track the file.
+    snapshot(None);
+    std::fs::rename(
+        workspace_root.join("CaseFile.txt"),
+        workspace_root.join("casefile.txt"),
+    )?;
+    std::fs::write(workspace_root.join("casefile.txt"), "new\n")?;
+    let tree_state = snapshot(Some(vec![PathBuf::from("casefile.txt")]));
+
+    let expected = create_tree(repo, &[(repo_path("CaseFile.txt"), "new\n")]);
+    assert_tree_eq!(*tree_state.current_tree(), expected);
+    Ok(())
+}
+
+#[test]
 fn test_check_out_existing_directory_symlink_icase_fs() -> TestResult {
     if !check_symlink_support()? {
         eprintln!("Skipping test because symlink isn't supported");

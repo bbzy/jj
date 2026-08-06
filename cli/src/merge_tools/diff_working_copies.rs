@@ -313,6 +313,7 @@ diff editing in mind and be a little inaccurate.
                 start_tracking_matcher: &EverythingMatcher,
                 force_tracking_matcher: &NothingMatcher,
                 max_new_file_size: u64::MAX,
+                case_reference_tree: None,
             })
             .await?;
         Ok(output_tree_state.current_tree().clone())

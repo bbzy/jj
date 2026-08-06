@@ -2030,6 +2030,7 @@ to the current parents may contain changes from multiple commits.
             start_tracking_matcher,
             force_tracking_matcher: &NothingMatcher,
             max_new_file_size,
+            case_reference_tree: None,
         })
     }
 
@@ -2492,10 +2493,22 @@ to the current parents may contain changes from multiple commits.
         };
 
         self.user_repo = ReadonlyUserRepo::new(repo);
+        // Canonicalize fsmonitor-reported paths against the parent tree's
+        // casing (the committed baseline) rather than the recorded file
+        // states, which may have been polluted by earlier case-insensitive
+        // checkouts.
+        let parent_tree = wc_commit
+            .parents()
+            .await
+            .map_err(snapshot_command_error)?
+            .into_iter()
+            .next()
+            .map(|parent| parent.tree());
         let (new_tree, stats) = {
             let mut options = options;
             let progress = crate::progress::snapshot_progress(ui);
             options.progress = progress.as_ref().map(|x| x as _);
+            options.case_reference_tree = parent_tree.as_ref();
             locked_ws
                 .locked_wc()
                 .snapshot(&options)

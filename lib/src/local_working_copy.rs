@@ -122,6 +122,7 @@ use crate::ref_name::WorkspaceNameBuf;
 use crate::repo_path::RepoPath;
 use crate::repo_path::RepoPathBuf;
 use crate::repo_path::RepoPathComponent;
+use crate::repo_path::RepoPathComponentBuf;
 use crate::settings::UserSettings;
 use crate::store::Store;
 use crate::working_copy::CheckoutError;
@@ -495,6 +496,29 @@ impl<'a> FileStates<'a> {
         let pos = self.exact_position_at(dir, name)?;
         let (_, state) = file_state_entry_from_proto(&self.data[pos]);
         Some(state)
+    }
+
+    /// Returns the tracked name of a direct child of `dir` equal to `name`
+    /// ignoring ASCII case, or `None` if there is no match or the match is
+    /// ambiguous (multiple tracked entries differ only in case). Requires
+    /// that all entries share the same prefix `dir`.
+    fn component_at_case_insensitive(&self, dir: &RepoPath, name: &str) -> Option<String> {
+        debug_assert!(self.paths().all(|path| path.starts_with(dir)));
+        let slash_len = usize::from(!dir.is_root());
+        let prefix_len = dir.as_internal_file_string().len() + slash_len;
+        let mut found: Option<&str> = None;
+        for entry in self.data {
+            let tail = entry.path.get(prefix_len..).unwrap_or("");
+            let entry_name = tail.split_once('/').map_or(tail, |(name, _)| name);
+            if entry_name.eq_ignore_ascii_case(name) {
+                match found {
+                    None => found = Some(entry_name),
+                    Some(prev) if prev == entry_name => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        found.map(str::to_owned)
     }
 
     fn exact_position(&self, path: &RepoPath) -> Option<usize> {
@@ -1415,6 +1439,7 @@ impl TreeState {
             start_tracking_matcher,
             force_tracking_matcher,
             max_new_file_size,
+            case_reference_tree,
         } = options;
 
         let sparse_matcher = self.sparse_matcher();
@@ -1470,6 +1495,7 @@ impl TreeState {
                 max_new_file_size: *max_new_file_size,
                 git_attributes: snapshot_git_attributes,
                 filter_driver_cache: self.filter_driver_cache.clone(),
+                ignore_case: fs_ignore_case(),
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1514,14 +1540,59 @@ impl TreeState {
             self.file_states
                 .merge_in(changed_file_states, &deleted_files);
         });
+        let mut path_rewrites: Vec<(RepoPathBuf, RepoPathBuf)> = Vec::new();
         trace_span!("write tree")
             .in_scope(async || -> Result<(), BackendError> {
                 let new_tree = tree_builder.write_tree().await?;
+                // On case-insensitive filesystems, rebase the recorded tree's
+                // paths onto the reference (committed) tree's casing, like
+                // Git's core.ignorecase comparing on-disk names against the
+                // index. Without this, a case-only difference (e.g. a
+                // directory casing clash like `subagent/` vs `Subagent/`)
+                // would be recorded as delete+add churn on every snapshot.
+                // Only normalize when the snapshot actually diverges from the
+                // reference tree; in the common healthy case (on-disk casing
+                // matches the committed tree) this is a cheap O(1) tree-id
+                // comparison.
+                let (new_tree, rewrites) = match *case_reference_tree {
+                    Some(reference)
+                        if fs_ignore_case()
+                            && new_tree.tree_ids_and_labels()
+                                != reference.tree_ids_and_labels() =>
+                    {
+                        normalize_paths_to_case_reference(
+                            new_tree,
+                            Some(reference),
+                            &self.working_copy_path,
+                        )
+                        .await?
+                    }
+                    _ => (new_tree, Vec::new()),
+                };
+                path_rewrites = rewrites;
                 is_dirty |= new_tree.tree_ids_and_labels() != self.tree.tree_ids_and_labels();
                 self.tree = new_tree.clone();
                 Ok(())
             })
             .await?;
+        // Keep the recorded file states in sync with the paths that were
+        // rewritten to the reference casing above, so tree paths and state
+        // paths stay consistent for the next snapshot.
+        if !path_rewrites.is_empty() {
+            let all_states = self.file_states.all();
+            let mut changed_file_states = Vec::new();
+            let mut deleted_files = Vec::new();
+            for (old_path, new_path) in &path_rewrites {
+                if let Some(file_state) = all_states.get(old_path) {
+                    changed_file_states.push((new_path.clone(), file_state));
+                    deleted_files.push(old_path.clone());
+                }
+            }
+            let _ = all_states;
+            is_dirty |= !changed_file_states.is_empty();
+            let deleted_files = HashSet::from_iter(deleted_files);
+            self.file_states.merge_in(changed_file_states, &deleted_files);
+        }
         if cfg!(debug_assertions) {
             let tree_paths: HashSet<_> = self
                 .tree
@@ -1546,6 +1617,47 @@ impl TreeState {
     }
 
     #[instrument(skip_all)]
+    /// Canonicalizes an fsmonitor-reported path to the tracked casing on
+    /// case-insensitive filesystems (see [`fs_ignore_case`]). The fsmonitor
+    /// reports on-disk names, which may differ in case from tracked paths;
+    /// without this, the matcher built from those names would silently miss
+    /// changes to case-renamed files. Components matching nothing tracked are
+    /// kept as-is.
+    fn canonicalize_fs_path(&self, path: &RepoPath) -> RepoPathBuf {
+        if !fs_ignore_case() {
+            return path.to_owned();
+        }
+        let file_states = self.file_states.all();
+        let mut canonical = RepoPathBuf::root();
+        for component in path.components() {
+            let name = component.as_internal_str();
+            // Fast path: check the in-memory file states first. An exact
+            // match (binary search, O(log N)) or a prefix hit means the
+            // casing is already tracked and needs no canonicalization. This
+            // covers the overwhelming majority of watchman-reported paths.
+            let sub = file_states.prefixed(&canonical);
+            let tracked = if sub.get_at(&canonical, component).is_some()
+                || !sub.prefixed_at(&canonical, component).is_empty()
+            {
+                None
+            } else {
+                // Exact match missed — try case-insensitive lookup in the
+                // in-memory file states (linear scan of the prefix subset,
+                // but all in memory, no git I/O). The reference tree is
+                // deliberately not consulted here: a miss means the path is
+                // simply untracked (e.g. a brand-new file), and scanning the
+                // whole reference tree for every new file is far too
+                // expensive. Any casing difference is corrected downstream by
+                // normalize_paths_to_case_reference() when the tree is
+                // written.
+                sub.component_at_case_insensitive(&canonical, name)
+            };
+            let resolved = tracked.unwrap_or_else(|| name.to_owned());
+            canonical = canonical.join(RepoPathComponent::new(&resolved).unwrap());
+        }
+        canonical
+    }
+
     async fn make_fsmonitor_matcher(
         &self,
         fsmonitor_settings: &FsmonitorSettings,
@@ -1579,6 +1691,7 @@ impl TreeState {
                         let repo_paths = changed_files
                             .iter()
                             .filter_map(|path| RepoPathBuf::from_relative_path(path).ok())
+                            .map(|path| self.canonicalize_fs_path(&path))
                             .collect_vec();
                         // .gitignore changes require rescanning parent directories to pick up newly
                         // unignored files.
@@ -1650,6 +1763,242 @@ struct FileSnapshotter<'a> {
 
     git_attributes: Arc<GitAttributes>,
     filter_driver_cache: Arc<FilterDriverCache>,
+
+    ignore_case: bool,
+}
+
+/// Whether working-copy paths should be matched case-insensitively, aligned
+/// with Git's core.ignorecase default for the platform.
+fn fs_ignore_case() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+/// Returns true if both paths resolve to the same disk entry. On a
+/// case-insensitive filesystem, paths differing only in case resolve to the
+/// same file; on a case-sensitive filesystem, they are distinct entries (or
+/// only one of them exists).
+#[cfg(unix)]
+fn same_disk_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (a.symlink_metadata(), b.symlink_metadata()) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Windows version of [`same_disk_file`].
+#[cfg(windows)]
+fn same_disk_file(a: &Path, b: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    match (a.symlink_metadata(), b.symlink_metadata()) {
+        (Ok(a), Ok(b)) => {
+            a.volume_serial_number() == b.volume_serial_number() && a.file_index() == b.file_index()
+        }
+        _ => false,
+    }
+}
+
+/// Builds a lowercase-name → tracked-name index of the direct children of
+/// `dir`. Entries whose name collides with a differently-cased tracked entry
+/// map to `None` (ambiguous, fall back to case-sensitive matching).
+fn build_case_insensitive_index(
+    dir: &RepoPath,
+    file_states: FileStates<'_>,
+) -> HashMap<String, Option<String>> {
+    let slash_len = usize::from(!dir.is_root());
+    let prefix_len = dir.as_internal_file_string().len() + slash_len;
+    let mut index: HashMap<String, Option<String>> = HashMap::new();
+    for (path, _state) in file_states.iter() {
+        let tail = path.as_internal_file_string().get(prefix_len..).unwrap_or("");
+        let entry_name = tail.split_once('/').map_or(tail, |(name, _)| name);
+        index
+            .entry(entry_name.to_ascii_lowercase())
+            .and_modify(|slot| {
+                if slot.as_deref() != Some(entry_name) {
+                    *slot = None;
+                }
+            })
+            .or_insert_with(|| Some(entry_name.to_owned()));
+    }
+    index
+}
+
+/// Rebuilds `tree` with entry paths rebased onto `case_reference_tree`'s
+/// casing (typically the parent commit's tree), like Git's core.ignorecase
+/// comparing on-disk names against the index. Returns the rewritten tree
+/// together with the `(old, new)` path pairs that changed, so callers can
+/// keep recorded file states in sync.
+///
+/// Uses `diff_stream` to visit only the paths that differ between `tree` and
+/// `case_reference_tree`, rather than scanning both trees in full. This is
+/// critical for large repos: `tree.entries()` reads every tree object from
+/// the backend (e.g. an 18 GB git pack), while `diff_stream` skips entire
+/// subtrees whose IDs match.
+async fn normalize_paths_to_case_reference(
+    tree: MergedTree,
+    case_reference_tree: Option<&MergedTree>,
+    working_copy_path: &Path,
+) -> Result<(MergedTree, Vec<(RepoPathBuf, RepoPathBuf)>), BackendError> {
+    let Some(reference) = case_reference_tree else {
+        return Ok((tree, Vec::new()));
+    };
+    // Collect the diff between the new snapshot tree and the reference tree.
+    // The diff stream only visits paths that actually differ, skipping
+    // unchanged subtrees via tree-ID comparison.
+    // Note: diff_stream(self, other) sets Diff.before = self (new tree),
+    // Diff.after = other (reference tree).
+    let mut removed: Vec<RepoPathBuf> = Vec::new();  // in reference, absent in new tree
+    let mut added: Vec<(RepoPathBuf, MergedTreeValue)> = Vec::new();  // in new tree, absent in reference
+    let mut diff = tree.diff_stream(reference, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let TreeDiffEntry { path, values } = entry;
+        let values = values?;
+        if values.before.is_present() && values.after.is_absent() {
+            // Present in new tree, absent in reference: added (new casing)
+            added.push((path, values.before));
+        } else if values.after.is_present() && values.before.is_absent() {
+            // Present in reference, absent in new tree: removed (old casing)
+            removed.push(path);
+        }
+        // Modified files (present in both) never need case normalization.
+    }
+    if added.is_empty() {
+        return Ok((tree, Vec::new()));
+    }
+    // Build a lowercase → canonical-path index from only the removed paths.
+    let mut index: HashMap<String, Option<RepoPathBuf>> = HashMap::new();
+    for path in &removed {
+        let key = path.as_internal_file_string().to_ascii_lowercase();
+        match index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(path) {
+                    entry.insert(None);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(path.clone()));
+            }
+        }
+    }
+    // Match added paths against removed paths case-insensitively.
+    let mut rewrites = Vec::new();
+    let mut builder = MergedTreeBuilder::new(tree.clone());
+    let mut reference_lookup = match reference.trees().await?.into_resolved() {
+        Ok(root) => Some(CaseInsensitivePathLookup::new(root)),
+        Err(_) => None,
+    };
+    for (path, value) in &added {
+        let canonical = match index.get(&path.as_internal_file_string().to_ascii_lowercase()) {
+            Some(Some(path)) => Some(path.clone()),
+            Some(None) => None,
+            None => match &mut reference_lookup {
+                Some(lookup) => lookup.unique_path(path).await?,
+                None => None,
+            },
+        };
+        if let Some(canonical) = canonical
+            && &canonical != path
+            // fs_ignore_case() only reflects the platform default; the actual
+            // volume may be case-sensitive (e.g. case-sensitive APFS). Only
+            // rewrite when both names resolve to the same disk entry, so a
+            // genuinely distinct added file isn't folded into the
+            // differently-cased tracked path.
+            && same_disk_file(
+                &path.to_fs_path_unchecked(working_copy_path),
+                &canonical.to_fs_path_unchecked(working_copy_path),
+            )
+        {
+            builder.set_or_remove(path.clone(), Merge::absent());
+            builder.set_or_remove(canonical.clone(), value.clone());
+            rewrites.push((path.clone(), canonical.clone()));
+        }
+    }
+    let rewritten = if rewrites.is_empty() {
+        tree
+    } else {
+        builder.write_tree().await?
+    };
+    Ok((rewritten, rewrites))
+}
+
+/// Finds the unique path in `tree` equal to `path` ignoring ASCII case.
+///
+/// Unlike component-by-component canonicalization, this keeps multiple
+/// candidates alive when an intermediate directory is ambiguous. For example,
+/// a reference tree may contain both `Subagent/manager` and `subagent/view` on
+/// a case-insensitive filesystem. The on-disk `Subagent/view` still maps
+/// uniquely to the latter complete path even though its first component alone
+/// is ambiguous.
+struct CaseInsensitivePathLookup {
+    root: crate::tree::Tree,
+    names_by_tree: HashMap<TreeId, HashMap<String, Vec<RepoPathComponentBuf>>>,
+}
+
+impl CaseInsensitivePathLookup {
+    fn new(root: crate::tree::Tree) -> Self {
+        Self {
+            root,
+            names_by_tree: HashMap::new(),
+        }
+    }
+
+    fn matching_names(
+        &mut self,
+        tree: &crate::tree::Tree,
+        component: &RepoPathComponent,
+    ) -> Vec<RepoPathComponentBuf> {
+        self.names_by_tree
+            .entry(tree.id().clone())
+            .or_insert_with(|| {
+                let mut names: HashMap<String, Vec<RepoPathComponentBuf>> = HashMap::new();
+                for entry in tree.entries_non_recursive() {
+                    names
+                        .entry(entry.name().as_internal_str().to_ascii_lowercase())
+                        .or_default()
+                        .push(entry.name().to_owned());
+                }
+                names
+            })
+            .get(&component.as_internal_str().to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn unique_path(
+        &mut self,
+        path: &RepoPath,
+    ) -> Result<Option<RepoPathBuf>, BackendError> {
+        const MAX_CANDIDATES: usize = 64;
+        let components = path.components().collect_vec();
+        let mut candidates = vec![(RepoPathBuf::root(), self.root.clone())];
+        for (index, component) in components.iter().enumerate() {
+            let is_last = index + 1 == components.len();
+            let mut next_candidates = Vec::new();
+            let mut matches = Vec::new();
+            for (candidate_path, candidate_tree) in candidates {
+                let names = self.matching_names(&candidate_tree, component);
+                for name in names {
+                    let matched_path = candidate_path.join(&name);
+                    if is_last {
+                        matches.push(matched_path);
+                    } else if let Some(sub_tree) = candidate_tree.sub_tree(&name).await? {
+                        next_candidates.push((matched_path, sub_tree));
+                    }
+                }
+                if matches.len() > MAX_CANDIDATES || next_candidates.len() > MAX_CANDIDATES {
+                    return Ok(None);
+                }
+            }
+            if is_last {
+                return Ok(matches.into_iter().exactly_one().ok());
+            }
+            if next_candidates.is_empty() {
+                return Ok(None);
+            }
+            candidates = next_candidates;
+        }
+        Ok(None)
+    }
 }
 
 impl FileSnapshotter<'_> {
@@ -1693,6 +2042,9 @@ impl FileSnapshotter<'_> {
 
         let git_ignore = git_ignore.chain_with_file(&dir, disk_dir.join(".gitignore"))?;
         let jj_ignore = jj_ignore.chain_with_file(&dir, disk_dir.join(".jjignore"))?;
+        // Case-insensitive tracked-name index for this directory, built lazily
+        // on the first exact-lookup miss (see fs_ignore_case).
+        let ci_index = OnceLock::new();
         let dir_entries: Vec<_> = disk_dir
             .read_dir()
             .and_then(|entries| entries.try_collect())
@@ -1706,9 +2058,17 @@ impl FileSnapshotter<'_> {
             // sequential scan should be fast enough.
             .with_min_len(100)
             .filter_map(|entry| {
-                self.process_dir_entry(&dir, &git_ignore, &jj_ignore, file_states, &entry, scope)
-                    .block_on()
-                    .transpose()
+                self.process_dir_entry(
+                    &dir,
+                    &git_ignore,
+                    &jj_ignore,
+                    file_states,
+                    &ci_index,
+                    &entry,
+                    scope,
+                )
+                .block_on()
+                .transpose()
             })
             .map(|item| match item {
                 Ok((PresentDirEntryKind::Dir, name)) => Ok(Either::Left(name)),
@@ -1721,12 +2081,14 @@ impl FileSnapshotter<'_> {
         Ok(())
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn process_dir_entry<'scope>(
         &'scope self,
         dir: &RepoPath,
         git_ignore: &Arc<GitIgnoreFile>,
         jj_ignore: &Arc<GitIgnoreFile>,
         file_states: FileStates<'scope>,
+        ci_index: &OnceLock<HashMap<String, Option<String>>>,
         entry: &DirEntry,
         scope: &rayon::Scope<'scope>,
     ) -> Result<Option<(PresentDirEntryKind, String)>, SnapshotError> {
@@ -1746,6 +2108,38 @@ impl FileSnapshotter<'_> {
         if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
             return Ok(None);
         }
+        // On case-insensitive filesystems (as with Git's core.ignorecase), the
+        // on-disk name may differ in case from the tracked path. Canonicalize
+        // to the tracked casing so a case-only difference isn't recorded as a
+        // delete+add change.
+        let name_string = if self.ignore_case
+            && file_states
+                .get_at(dir, RepoPathComponent::new(&name_string).unwrap())
+                .is_none()
+        {
+            let index = ci_index.get_or_init(|| build_case_insensitive_index(dir, file_states));
+            match index.get(name_string.to_ascii_lowercase().as_str()) {
+                // Ambiguous match (multiple tracked casings) or no match: keep
+                // the on-disk casing, preserving case-sensitive behavior.
+                Some(None) | None => name_string,
+                Some(Some(tracked)) if tracked != &name_string => {
+                    // Canonicalize only when the tracked casing resolves to
+                    // the same disk entry. On a case-sensitive volume (unusual
+                    // on these platforms) the tracked casing may exist as a
+                    // genuinely different file (or not exist at all); then
+                    // this entry must not be canonicalized.
+                    let tracked_disk_path = entry.path().with_file_name(tracked);
+                    if same_disk_file(&tracked_disk_path, &entry.path()) {
+                        tracked.clone()
+                    } else {
+                        name_string
+                    }
+                }
+                Some(Some(_)) => name_string,
+            }
+        } else {
+            name_string
+        };
         let name = RepoPathComponent::new(&name_string).unwrap();
         let path = dir.join(name);
         let maybe_current_file_state = file_states.get_at(dir, name);
@@ -3528,6 +3922,32 @@ mod tests {
                 new_static_entry("c", 13),
             ],
         );
+    }
+
+    #[test]
+    #[test]
+    fn test_build_case_insensitive_index() {
+        let new_proto_entry = |path: &str, size| {
+            file_state_entry_to_proto(repo_path(path).to_owned(), &new_state(size))
+        };
+        let data = vec![
+            new_proto_entry("CaseFile.txt", 0),
+            new_proto_entry("DUP/B", 1),
+            new_proto_entry("SubDir/Inner.TXT", 2),
+            new_proto_entry("SubDir/other", 3),
+            new_proto_entry("dup/A", 4),
+        ];
+        let file_states = FileStates::from_sorted(&data);
+
+        let index = build_case_insensitive_index(RepoPath::root(), file_states);
+        assert_eq!(index["casefile.txt"], Some("CaseFile.txt".to_owned()));
+        assert_eq!(index["subdir"], Some("SubDir".to_owned()));
+        // Ambiguous: "dup" and "DUP" differ only in case.
+        assert_eq!(index["dup"], None);
+
+        let sub_index = build_case_insensitive_index(repo_path("SubDir"), file_states);
+        assert_eq!(sub_index["inner.txt"], Some("Inner.TXT".to_owned()));
+        assert_eq!(sub_index["other"], Some("other".to_owned()));
     }
 
     #[test]
