@@ -46,6 +46,34 @@ fn test_workspaces_invalid_name() {
     ");
 }
 
+#[test]
+fn test_workspaces_add_invalid_revision() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    let output = main_dir.run_jj(["workspace", "add", "../secondary", "-r", "does-not-exist"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Error: Revision `does-not-exist` doesn't exist
+    [EOF]
+    [exit status: 1]
+    ");
+    assert!(!test_env.env_root().join("secondary").exists());
+
+    let output = main_dir.run_jj(["workspace", "list", "-T", r#"name ++ "\n""#]);
+    insta::assert_snapshot!(output, @"
+    default
+    [EOF]
+    ");
+
+    // Correcting the revision should work without manually cleaning up the
+    // failed attempt.
+    main_dir
+        .run_jj(["workspace", "add", "../secondary", "-r", "root()"])
+        .success();
+}
+
 /// Test adding a second and a third workspace
 #[test]
 fn test_workspaces_add_second_and_third_workspace() {
