@@ -477,22 +477,49 @@ impl CommandHelper {
     ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
         let workspace = self.load_workspace()?;
         let env = self.workspace_environment(ui, &workspace)?;
-        // Acquire the lock to ensure that the loaded repo points to the head
-        // operation whose refs should be synchronized with the Git repo. This
-        // prevents races with other processes during Git HEAD and refs
-        // import/export.
-        let git_import_export_lock = self
-            .is_working_copy_writable()
-            .then(|| env.lock_git_import_export(&workspace))
-            .transpose()?;
-        let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
-        let Some(git_import_export_lock) = git_import_export_lock else {
-            return Ok((workspace_command, SnapshotStats::default(), false));
+        let git_import_export_lock = if self.is_working_copy_writable() {
+            env.lock_git_import_export(&workspace)?
+        } else {
+            GitImportExportLock { _lock: None }
         };
+        self.workspace_helper_with_stats_and_lock(ui, workspace, env, &git_import_export_lock)
+            .await
+    }
+
+    /// Loads and snapshots the workspace while retaining the shared Git ref lock.
+    /// Fetch must hold this until its operation is published, including when run
+    /// from a non-colocated workspace or with `--ignore-working-copy`.
+    pub(crate) async fn workspace_helper_with_git_lock(
+        &self,
+        ui: &Ui,
+    ) -> Result<(WorkspaceCommandHelper, GitImportExportLock), CommandError> {
+        let workspace = self.load_workspace()?;
+        let env = self.workspace_environment(ui, &workspace)?;
+        let lock = GitImportExportLock::lock(&workspace)?;
+        let (workspace_command, stats, _) = self
+            .workspace_helper_with_stats_and_lock(ui, workspace, env, &lock)
+            .await?;
+        print_snapshot_stats(ui, &stats, workspace_command.env().path_converter())?;
+        Ok((workspace_command, lock))
+    }
+
+    async fn workspace_helper_with_stats_and_lock(
+        &self,
+        ui: &Ui,
+        workspace: Workspace,
+        env: WorkspaceCommandEnvironment,
+        git_import_export_lock: &GitImportExportLock,
+    ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
+        // Load the operation only after acquiring the lock, so refs and the
+        // operation describe the same state after waiting for another command.
+        let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
+        if !self.is_working_copy_writable() {
+            return Ok((workspace_command, SnapshotStats::default(), false));
+        }
 
         let old_repo = workspace_command.repo().clone();
         let (workspace_command, stats) = match workspace_command
-            .snapshot_impl(ui, &git_import_export_lock)
+            .snapshot_impl(ui, git_import_export_lock)
             .await
         {
             Ok(stats) => (workspace_command, stats),
@@ -508,7 +535,7 @@ impl CommandHelper {
                 // lower level (e.g. inside snapshot_working_copy()) to avoid recursive locking
                 // of the working copy.
                 let WorkspaceCommandHelper { workspace, env, .. } = workspace_command;
-                self.recover_stale_working_copy_impl(ui, workspace, env, &git_import_export_lock)
+                self.recover_stale_working_copy_impl(ui, workspace, env, git_import_export_lock)
                     .await?
             }
         };
@@ -1042,15 +1069,11 @@ impl WorkspaceCommandEnvironment {
         &self,
         workspace: &Workspace,
     ) -> Result<GitImportExportLock, CommandError> {
-        let lock = if self.working_copy_shared_with_git {
-            let lock_path = workspace.repo_path().join("git_import_export.lock");
-            Some(FileLock::lock(lock_path).map_err(|err| {
-                user_error_with_message("Failed to take lock for Git import/export", err)
-            })?)
+        if self.working_copy_shared_with_git {
+            GitImportExportLock::lock(workspace)
         } else {
-            None
-        };
-        Ok(GitImportExportLock { _lock: lock })
+            Ok(GitImportExportLock { _lock: None })
+        }
     }
 
     /// Parsing context for fileset expressions specified by command arguments.
@@ -1248,11 +1271,21 @@ impl WorkspaceCommandEnvironment {
     }
 }
 
-/// A token that holds a lock for git import/export operations in colocated
-/// repositories. For non-colocated repos, this is an empty token (no actual
-/// lock held). The lock is automatically released when this token is dropped.
+/// A token that holds the shared Git ref lock. Snapshotting a non-colocated
+/// workspace uses an empty token; fetch always locks the shared repository.
+/// The lock is automatically released when this token is dropped.
 pub struct GitImportExportLock {
     _lock: Option<FileLock>,
+}
+
+impl GitImportExportLock {
+    fn lock(workspace: &Workspace) -> Result<Self, CommandError> {
+        let lock_path = workspace.repo_path().join("git_import_export.lock");
+        let lock = FileLock::lock(lock_path).map_err(|err| {
+            user_error_with_message("Failed to take lock for Git import/export", err)
+        })?;
+        Ok(Self { _lock: Some(lock) })
+    }
 }
 
 /// Provides utilities for writing a command that works on a [`Workspace`]
@@ -3340,6 +3373,25 @@ impl WorkspaceCommandTransaction<'_> {
     }
 
     pub async fn finish(self, ui: &Ui, description: impl Into<String>) -> Result<(), CommandError> {
+        self.finish_impl(ui, description, None).await
+    }
+
+    /// Finishes a transaction without reacquiring the caller's Git ref lock.
+    pub(crate) async fn finish_with_git_lock(
+        self,
+        ui: &Ui,
+        description: impl Into<String>,
+        lock: &GitImportExportLock,
+    ) -> Result<(), CommandError> {
+        self.finish_impl(ui, description, Some(lock)).await
+    }
+
+    async fn finish_impl(
+        self,
+        ui: &Ui,
+        description: impl Into<String>,
+        lock: Option<&GitImportExportLock>,
+    ) -> Result<(), CommandError> {
         let Self { helper, mut tx, .. } = self;
         if !tx.repo().has_changes() {
             writeln!(ui.status(), "Nothing changed.")?;
@@ -3351,9 +3403,16 @@ impl WorkspaceCommandTransaction<'_> {
         }
         // Acquire git import/export lock before finishing the transaction to ensure
         // Git HEAD export happens atomically with the transaction commit.
-        let git_import_export_lock = helper.lock_git_import_export()?;
+        let owned_lock;
+        let git_import_export_lock = match lock {
+            Some(lock) => lock,
+            None => {
+                owned_lock = helper.lock_git_import_export()?;
+                &owned_lock
+            }
+        };
         helper
-            .finish_transaction(ui, tx, description, &git_import_export_lock)
+            .finish_transaction(ui, tx, description, git_import_export_lock)
             .await
     }
 

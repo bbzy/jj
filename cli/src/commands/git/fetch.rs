@@ -138,7 +138,10 @@ pub async fn cmd_git_fetch(
         // into a temporary namespace.
         return Err(cli_error("--no-integrate-operation is not respected"));
     }
-    let mut workspace_command = command.workspace_helper(ui).await?;
+    // Git pruning exposes an intermediate ref state. Keep automatic imports
+    // from observing it until the complete fetch operation has been published.
+    let (mut workspace_command, git_import_export_lock) =
+        command.workspace_helper_with_git_lock(ui).await?;
     let remote_expr = if args.all_remotes {
         StringExpression::all()
     } else if let Some(remotes) = &args.remotes {
@@ -251,12 +254,13 @@ pub async fn cmd_git_fetch(
         warn_if_branches_not_found(ui, &tx, bookmark_expr, &matching_remotes)?;
     }
     // TODO: warn_if_tags_not_found()
-    tx.finish(
+    tx.finish_with_git_lock(
         ui,
         format!(
             "fetch from git remote(s) {}",
             matching_remotes.iter().map(|n| n.as_symbol()).join(",")
         ),
+        &git_import_export_lock,
     )
     .await?;
     Ok(())
